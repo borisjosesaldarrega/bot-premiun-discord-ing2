@@ -9451,4 +9451,257 @@ async def resolve_song(
         raise MusicSearchError(f"{msg}\nConsulta: `{query}`") from e
 
 
+
+# ================================================================
+# PARCHE DZKNIGHT: viejo con control + fallback relajado inteligente
+# ================================================================
+# La idea:
+# - Cookies NO son una base de datos de canciones; solo sirven para autenticación.
+# - Si YouTube/Render no entrega el oficial, el bot no debe morirse si encontró
+#   un candidato muy parecido. Primero intenta limpio; si todo falla, acepta
+#   una versión cercana segura (normalmente remix) antes de rendirse.
+# - Karaoke/instrumental/reaction/tutorial/type beat siguen bloqueados salvo que
+#   el usuario los pida explícitamente.
+
+_RELAXED_VERSION_FALLBACK = os.getenv("ALLOW_RELAXED_MUSIC_FALLBACK", "true").lower() in {"1", "true", "yes", "on"}
+
+
+def _relaxed_version_candidate_allowed(info: Dict, clean_query: str) -> bool:
+    """Permite una versión cercana solo como último recurso.
+
+    Esto imita al bot viejo en lo bueno: reproducir algo cuando sí hay audio.
+    Pero conserva control: no acepta karaoke/instrumental/covers basura si no
+    los pidieron. El caso típico permitido es un remix/visualizer muy parecido
+    cuando el oficial no aparece en Render.
+    """
+    if not _RELAXED_VERSION_FALLBACK:
+        return False
+    if not isinstance(info, dict):
+        return False
+
+    q = str(clean_query or "").lower()
+    title = str(info.get("title") or "").lower()
+    uploader = str(info.get("uploader") or info.get("channel") or "").lower()
+    haystack = f"{title} {uploader}"
+
+    # Estos NO los aceptamos como fallback salvo que el usuario los pida.
+    hard_blocked = [
+        "karaoke", "instrumental", "reaction", "tutorial", "type beat",
+        "cover", "acoustic", "acústico", "8d", "bass boosted"
+    ]
+    for word in hard_blocked:
+        if word in haystack and word not in q:
+            return False
+
+    # Debe parecerse bastante a lo pedido. Si no, sería lotería.
+    try:
+        ratio = _music_match_ratio(info, clean_query)
+    except Exception:
+        ratio = 0.0
+
+    q_tokens = _music_tokens(clean_query)
+    result_tokens = _music_tokens(f"{title} {uploader}")
+    common = q_tokens & result_tokens
+
+    if ratio >= 0.66:
+        return True
+    if len(q_tokens) >= 3 and len(common) >= max(2, len(q_tokens) - 1):
+        return True
+    return False
+
+
+def _relaxed_score(info: Dict, clean_query: str) -> int:
+    """Puntúa candidatos de fallback relajado."""
+    try:
+        score = _score_music_candidate(info, clean_query)
+    except Exception:
+        score = 0
+    title = str(info.get("title") or "").lower()
+    uploader = str(info.get("uploader") or info.get("channel") or "").lower()
+    haystack = f"{title} {uploader}"
+    # Preferimos visualizer/audio/video antes que remixes raros.
+    for good in ("official", "oficial", "audio", "visualizer", "video"):
+        if good in haystack:
+            score += 8
+    # Remix se permite, pero como último recurso.
+    if "remix" in haystack:
+        score -= 18
+    if "slowed" in haystack or "reverb" in haystack or "sped" in haystack:
+        score -= 25
+    return score
+
+
+async def _extract_music_old_brutal(
+    query: str,
+    *,
+    search_limit: int = 1,
+    clean_query_for_filter: Optional[str] = None,
+):
+    """Extractor viejo con control flexible.
+
+    Primero busca candidatos limpios. Si todos los candidatos con audio son
+    versiones rechazadas, permite el mejor candidato cercano como último recurso.
+    Esto evita que canciones nuevas o poco indexadas fallen solo porque YouTube
+    en Render no entregó el resultado oficial.
+    """
+    raw_query = str(query or "").strip()
+    if not raw_query:
+        raise MusicSearchError("Búsqueda vacía.")
+
+    cached = _get_fast_cached(raw_query)
+    if cached:
+        return cached
+
+    is_url = bool(URL_REGEX.match(raw_query))
+    is_prefixed = bool(re.match(r"^(ytsearch|scsearch)\d*:", raw_query, re.IGNORECASE))
+    search_value = raw_query if (is_url or is_prefixed) else f"ytsearch{max(1, min(search_limit, 6))}:{raw_query}"
+    is_soundcloud = search_value.lower().startswith("scsearch") or "soundcloud.com" in search_value.lower()
+
+    cookiefile = get_cookiefile_path()
+    attempts = _attempt_cookie_order(is_url=is_url, is_soundcloud=is_soundcloud, cookiefile=cookiefile)
+
+    last_error = None
+    rejected: List[str] = []
+    relaxed_candidates: List[tuple] = []
+
+    for use_cookies in attempts:
+        opts = dict(ydl_opts)
+        opts.pop("cookiefile", None)
+        opts.update({
+            "format": "bestaudio/best",
+            "default_search": "ytsearch",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "ignore_no_formats_error": True,
+            "extract_flat": False,
+            "cachedir": False,
+            "logger": QuietYDLLogger(),
+            "extractor_args": get_youtube_extractor_args(),
+        })
+        if use_cookies and cookiefile:
+            opts["cookiefile"] = cookiefile
+
+        try:
+            with youtube_dl.YoutubeDL(opts) as ydl:
+                info = await asyncio.wait_for(
+                    extract_info_async(ydl, search_value, download=False),
+                    timeout=_FAST_YTDLP_TIMEOUT,
+                )
+
+            entries = _normalize_yt_dlp_dump(info)
+            if not entries:
+                raise MusicSearchError("yt-dlp no devolvió entradas.")
+
+            # Ordenamos para que los candidatos más fuertes se prueben primero,
+            # como control extra sin perder velocidad.
+            if clean_query_for_filter and not is_url:
+                entries = sorted(entries, key=lambda e: _score_music_candidate(e, clean_query_for_filter), reverse=True)
+
+            for entry in entries:
+                audio_url = _pick_audio_url_from_info(entry)
+                if not audio_url:
+                    continue
+
+                if clean_query_for_filter and not is_url:
+                    reason = _candidate_reject_reason(entry, clean_query_for_filter)
+                    if reason:
+                        rejected.append(reason[:140])
+                        if _relaxed_version_candidate_allowed(entry, clean_query_for_filter):
+                            relaxed_candidates.append((_relaxed_score(entry, clean_query_for_filter), entry, audio_url, reason))
+                        continue
+
+                logger.info(
+                    "Extractor rápido resolvió (%s): %s",
+                    "cookies" if use_cookies else "sin cookies",
+                    str(entry.get("title") or raw_query)[:110],
+                )
+                _set_fast_cached(raw_query, entry, audio_url)
+                return entry, audio_url
+
+            # Si no hubo candidato limpio, pero sí candidato cercano, lo usamos.
+            if relaxed_candidates:
+                relaxed_candidates.sort(key=lambda x: x[0], reverse=True)
+                _, best_entry, best_audio, best_reason = relaxed_candidates[0]
+                logger.warning(
+                    "Fallback relajado activado para '%s': %s | motivo original: %s",
+                    raw_query[:90],
+                    str(best_entry.get("title") or raw_query)[:120],
+                    str(best_reason)[:140],
+                )
+                best_entry = dict(best_entry)
+                best_entry["_relaxed_fallback"] = True
+                best_entry["_relaxed_reason"] = str(best_reason)
+                _set_fast_cached(raw_query, best_entry, best_audio)
+                return best_entry, best_audio
+
+            if rejected:
+                raise MusicSearchError("Candidatos rechazados: " + " | ".join(rejected[:3]))
+            raise MusicSearchError("yt-dlp devolvió entradas, pero ninguna con audio.")
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Extractor rápido falló para '%s' (%s): %s",
+                raw_query[:110],
+                "cookies" if use_cookies else "sin cookies",
+                str(exc)[:180],
+            )
+
+    raise MusicSearchError(str(last_error or "Extractor rápido no pudo resolver audio."))
+
+
+async def resolve_song(
+    busqueda: str,
+    requested_by,
+    *,
+    max_duration: Optional[int] = None,
+    exclude_markers: Optional[Set[str]] = None,
+) -> Dict:
+    """Resolve final: URL exacta, texto con filtro, y fallback estilo viejo cuando conviene."""
+    original_query = str(busqueda or "").strip()
+    query = _remove_trailing_music_punctuation(_clean_search_query(original_query))
+    if not query:
+        raise MusicSearchError("Escribe el nombre o enlace de una canción.")
+
+    direct_requested = _query_is_direct_url(original_query) or _query_is_direct_url(query)
+    exclude_markers = set(exclude_markers or set())
+
+    try:
+        info, audio_url = await extract_music_legacy_like_bot18(original_query)
+        duration = _safe_int(info.get("duration"), 0)
+        if max_duration and duration and duration > max_duration:
+            raise MusicSearchError("La canción supera la duración máxima permitida.")
+
+        # Si es fallback relajado ya fue validado arriba. No lo castigamos dos veces.
+        relaxed_used = bool(isinstance(info, dict) and info.get("_relaxed_fallback"))
+        if not direct_requested and not relaxed_used:
+            reason = _candidate_reject_reason(info, query)
+            if reason:
+                raise MusicSearchError(reason)
+
+        song = {
+            "title": str(info.get("title") or query)[:100],
+            "url": audio_url,
+            "web_url": info.get("webpage_url") or info.get("original_url") or query,
+            "duration": duration,
+            "requested_by": requested_by,
+            "thumbnail": info.get("thumbnail") or "https://i.imgur.com/8Km9tLL.png",
+            "uploader": str(info.get("uploader") or info.get("channel") or "Artista desconocido")[:80],
+        }
+        if exclude_markers and (song_markers(song) & exclude_markers):
+            raise MusicSearchError("La canción ya está sonando, en cola o fue usada recientemente.")
+        if relaxed_used:
+            logger.warning("⚠️ Canción resuelta con fallback relajado: %s", song["title"])
+        else:
+            logger.info("⚡ Canción resuelta rápido: %s", song["title"])
+        return song
+    except Exception as e:
+        logger.warning("Resolve rápido falló para '%s': %s", query[:120], str(e)[:240])
+        if direct_requested:
+            msg = "No pude abrir ese enlace exacto de YouTube en Render. Prueba otro enlace del mismo tema o el nombre con artista."
+        else:
+            msg = "No pude encontrar audio reproducible. Probé sin cookies, con cookies, clientes alternos y fallback tipo bot viejo."
+        raise MusicSearchError(f"{msg}\nConsulta: `{query}`") from e
+
 bot.run(TOKEN)
