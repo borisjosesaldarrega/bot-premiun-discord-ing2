@@ -478,7 +478,7 @@ def get_deno_runtime_path() -> Optional[str]:
     return None
 
 
-async def run_yt_dlp_cli_json(query: str, *, use_cookies: bool = False, search_count: int = 3):
+async def run_yt_dlp_cli_json(query: str, *, use_cookies: bool = False, search_count: int = 2):
     """Ejecuta yt-dlp por CLI con Deno/EJS.
 
     En Render, el error "Requested format is not available" suele venir de YouTube
@@ -527,7 +527,7 @@ async def run_yt_dlp_cli_json(query: str, *, use_cookies: bool = False, search_c
     )
 
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=45)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=int(os.getenv("YTDLP_CLI_TIMEOUT", "20")))
     except asyncio.TimeoutError:
         process.kill()
         await process.communicate()
@@ -560,7 +560,7 @@ async def extract_music_with_cli_ejs(query: str):
     # Primero sin cookies. Con YouTube actual, cookies válidas a veces provocan formatos vacíos.
     for use_cookies in (False, True):
         try:
-            info = await run_yt_dlp_cli_json(query, use_cookies=use_cookies, search_count=3)
+            info = await run_yt_dlp_cli_json(query, use_cookies=use_cookies, search_count=2)
             entries = _normalize_yt_dlp_dump(info)
             if not entries:
                 raise MusicSearchError("yt-dlp CLI no devolvió entradas.")
@@ -589,40 +589,62 @@ async def extract_music_with_cli_ejs(query: str):
 
 
 async def extract_music_with_python_api_bot18(query: str):
-    """Extractor viejo del bot 18 usando la API Python de yt-dlp."""
+    """Extractor rápido estilo bot 18.
+
+    En tus logs de Render, la ruta que finalmente resolvió fue:
+    API bot18 + cookies. Por eso ahora va primero con cookies y después sin cookies.
+    Así evitamos gastar 40+ segundos intentando CLI/EJS antes de llegar al método que sí funcionó.
+    """
     is_url = bool(URL_REGEX.match(query))
     search_value = query if is_url else f"ytsearch:{query}"
 
-    # Igual que el bot 18, pero probando sin cookies y luego con cookies.
-    for use_cookies in (False, True):
+    cookiefile = get_cookiefile_path()
+    attempts = [True, False] if cookiefile else [False]
+
+    for use_cookies in attempts:
         opts = dict(ydl_opts)
         opts.pop("cookiefile", None)
-        if use_cookies:
-            cookiefile = get_cookiefile_path()
-            if cookiefile:
-                opts["cookiefile"] = cookiefile
-            else:
-                continue
+        opts["format"] = "bestaudio/best"
+        opts["default_search"] = "ytsearch"
+        opts["extract_flat"] = False
+        opts["quiet"] = True
+        opts["no_warnings"] = True
+        opts["ignoreerrors"] = True
+        opts["cachedir"] = False
+
+        if use_cookies and cookiefile:
+            opts["cookiefile"] = cookiefile
 
         try:
             with youtube_dl.YoutubeDL(opts) as ydl:
-                info = await extract_info_async(ydl, search_value, download=False)
+                info = await asyncio.wait_for(
+                    extract_info_async(ydl, search_value, download=False),
+                    timeout=int(os.getenv("YTDLP_API_TIMEOUT", "25"))
+                )
 
             entries = _normalize_yt_dlp_dump(info)
             if not entries:
                 raise MusicSearchError("yt-dlp no devolvió resultados válidos desde YouTube.")
 
-            info = entries[0]
-            audio_url = _pick_audio_url_from_info(info)
-            if not audio_url:
-                raise MusicSearchError("YouTube encontró el video, pero no entregó URL de audio reproducible.")
+            # Mantenemos el comportamiento viejo: tomar la primera entrada reproducible.
+            # Si la primera no trae audio, revisamos las siguientes sin filtrar de más.
+            for entry in entries:
+                audio_url = _pick_audio_url_from_info(entry)
+                if audio_url:
+                    logger.info(
+                        "Canción resuelta con API rápida bot18 (%s): %s",
+                        "cookies" if use_cookies else "sin cookies",
+                        str(entry.get("title") or query)[:100]
+                    )
+                    return entry, audio_url
 
-            logger.info(
-                "Canción resuelta con API estilo bot 18 (%s): %s",
-                "cookies" if use_cookies else "sin cookies",
-                str(info.get("title") or query)[:100]
+            raise MusicSearchError("YouTube encontró resultados, pero ninguno entregó URL de audio reproducible.")
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Extractor API bot18 tardó demasiado para '%s' (%s)",
+                query,
+                "cookies" if use_cookies else "sin cookies"
             )
-            return info, audio_url
         except Exception as exc:
             logger.warning(
                 "Extractor API bot18 falló para '%s' (%s): %s",
@@ -635,18 +657,18 @@ async def extract_music_with_python_api_bot18(query: str):
 
 
 async def extract_music_legacy_like_bot18(query: str):
-    """Extrae música priorizando que funcione en Render.
+    """Extrae música priorizando velocidad en Render.
 
-    Orden:
-    1. CLI con Deno/EJS, que es el fix real para el error de formatos/SABR.
-    2. API Python estilo bot 18, como respaldo.
+    Orden nuevo basado en tus logs:
+    1. API Python estilo bot 18 con cookies primero, que fue la que sí resolvió la canción.
+    2. CLI con Deno/EJS solo como respaldo si YouTube se pone exquisito.
     """
     try:
-        return await extract_music_with_cli_ejs(query)
-    except Exception as cli_error:
-        logger.warning("CLI EJS no pudo resolver '%s'; pruebo API bot18: %s", query, str(cli_error)[:220])
+        return await extract_music_with_python_api_bot18(query)
+    except Exception as api_error:
+        logger.warning("API bot18 no pudo resolver '%s'; pruebo CLI EJS: %s", query, str(api_error)[:220])
 
-    return await extract_music_with_python_api_bot18(query)
+    return await extract_music_with_cli_ejs(query)
 
 
 # --------------------------
@@ -1541,32 +1563,46 @@ def get_guild_volume(guild_id: int) -> float:
 
 
 async def create_audio_source(url: str, guild_id: Optional[int] = None):
-    """Crea fuente de audio usando primero el método del bot 18.
+    """Crea una fuente de audio estable para Discord.
 
-    En Render, FFmpegOpusAudio.from_probe fue el comportamiento que ya te funcionaba.
-    Si por alguna razón falla, recién intenta el método nuevo con PCMVolumeTransformer.
+    El error `FFmpeg exited with code -11` apunta a crash/segfault de FFmpeg.
+    Para evitarlo, ya NO usamos `FFmpegOpusAudio.from_probe` ni forzamos `libopus` aquí.
+    Enviamos PCM limpio y dejamos que discord.py/PyNaCl codifique el audio para Discord.
+    Es menos "fancy", pero es más estable en Render.
     """
-    try:
-        try:
-            return await discord.FFmpegOpusAudio.from_probe(
-                url,
-                method='fallback',
-                **LEGACY_FFMPEG_OPTIONS
-            )
-        except Exception as legacy_error:
-            logger.warning("FFmpeg legacy falló, intento audio PCM: %s", str(legacy_error)[:180])
+    executable = os.getenv("FFMPEG_PATH") or FFMPEG_EXECUTABLE or "ffmpeg"
 
+    before_options = (
+        '-nostdin '
+        '-hide_banner '
+        '-loglevel warning '
+        '-reconnect 1 '
+        '-reconnect_streamed 1 '
+        '-reconnect_delay_max 10 '
+        '-reconnect_at_eof 1 '
+        '-user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36" '
+    )
+
+    options = (
+        '-vn '
+        '-ac 2 '
+        '-ar 48000 '
+        '-f s16le '
+    )
+
+    try:
         raw_source = discord.FFmpegPCMAudio(
             url,
-            before_options=FFMPEG_BEFORE_OPTIONS,
-            options=FFMPEG_AUDIO_OPTIONS,
-            executable=FFMPEG_EXECUTABLE
+            before_options=before_options,
+            options=options,
+            executable=executable
         )
         volume = get_guild_volume(guild_id or 0)
+        logger.info("Fuente de audio creada con FFmpeg PCM: %s", executable)
         return discord.PCMVolumeTransformer(raw_source, volume=volume)
     except FileNotFoundError as e:
         raise RuntimeError(
-            "ffmpeg no está instalado o no está en el PATH. En Render necesitas que FFmpeg exista en el entorno."
+            "ffmpeg no está instalado o no está en el PATH. En Render usa `bash start.sh build` y `bash start.sh` para configurar FFMPEG_PATH."
         ) from e
 
 
