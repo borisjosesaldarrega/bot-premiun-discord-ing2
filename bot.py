@@ -518,6 +518,38 @@ def get_cookiefile_path() -> Optional[str]:
     return None
 
 
+
+def get_youtube_player_clients() -> List[str]:
+    """Clientes alternos de YouTube para yt-dlp.
+
+    Render a veces recibe resultados sin formatos de audio con el cliente normal.
+    Estos clientes ayudan a que yt-dlp pida formatos reproducibles sin depender
+    siempre de cookies. Se puede ajustar desde Render con:
+    YTDLP_YOUTUBE_CLIENTS=default,android_vr,android,ios,web_safari
+    """
+    raw = os.getenv("YTDLP_YOUTUBE_CLIENTS", "default,android_vr,android,ios,web_safari")
+    clients: List[str] = []
+    for part in raw.split(","):
+        client = part.strip()
+        if client and client not in clients:
+            clients.append(client)
+    return clients or ["default", "android_vr"]
+
+
+def get_youtube_extractor_args() -> Dict[str, Dict[str, List[str]]]:
+    """Extractor args para Python API de yt-dlp."""
+    return {
+        "youtube": {
+            "player_client": get_youtube_player_clients(),
+        }
+    }
+
+
+def youtube_extractor_args_cli() -> str:
+    """Extractor args equivalente para CLI de yt-dlp."""
+    return "youtube:player_client=" + ",".join(get_youtube_player_clients())
+
+
 ydl_opts = {
     'format': 'bestaudio/best',
     'default_search': 'ytsearch',
@@ -541,6 +573,7 @@ ydl_opts = {
     'geo_bypass': True,
     'no-cache-dir': True,
     'cachedir': False,
+    'extractor_args': get_youtube_extractor_args(),
 }
 
 cookie_path = get_cookiefile_path()
@@ -665,6 +698,8 @@ async def run_yt_dlp_cli_json(query: str, *, use_cookies: bool = False, search_c
         "bestaudio/best",
         "--default-search",
         "ytsearch",
+        "--extractor-args",
+        youtube_extractor_args_cli(),
     ]
 
     deno_path = get_deno_runtime_path()
@@ -775,6 +810,7 @@ async def extract_music_with_python_api_bot18(query: str):
         opts["ignore_no_formats_error"] = True
         opts["cachedir"] = False
         opts["logger"] = QuietYDLLogger()
+        opts["extractor_args"] = get_youtube_extractor_args()
 
         if use_cookies and cookiefile:
             opts["cookiefile"] = cookiefile
@@ -9276,6 +9312,7 @@ async def _extract_music_old_brutal(
             "extract_flat": False,
             "cachedir": False,
             "logger": QuietYDLLogger(),
+            "extractor_args": get_youtube_extractor_args(),
         })
         if use_cookies and cookiefile:
             opts["cookiefile"] = cookiefile
@@ -9410,7 +9447,7 @@ async def resolve_song(
         if direct_requested:
             msg = "No pude abrir ese enlace exacto de YouTube en Render. Prueba otro enlace del mismo tema o el nombre con artista."
         else:
-            msg = "No pude encontrar audio reproducible rápido. Prueba escribir artista + canción."
+            msg = "No pude encontrar audio reproducible rápido. Probé sin cookies, con cookies y clientes alternos de YouTube. Prueba otro enlace o artista + canción."
         raise MusicSearchError(f"{msg}\nConsulta: `{query}`") from e
 
 
