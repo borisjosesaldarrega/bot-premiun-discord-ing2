@@ -443,7 +443,20 @@ def _writable_cookiefile_copy(cookie_path: str) -> Optional[str]:
             safe_name = "render_secret_" + safe_name
         runtime_path = os.path.join(runtime_dir, safe_name)
 
-        shutil.copyfile(source_path, runtime_path)
+        # Si start.sh ya copió las cookies a /tmp y nos pasó esa misma ruta
+        # por YTDLP_COOKIES_FILE, NO debemos copiar el archivo sobre sí mismo.
+        # shutil.copyfile(source, source) lanza SameFileError y dejaba al bot
+        # pensando que las cookies eran inválidas.
+        try:
+            same_file = os.path.samefile(source_path, runtime_path)
+        except Exception:
+            same_file = os.path.abspath(source_path) == os.path.abspath(runtime_path)
+
+        if same_file:
+            runtime_path = source_path
+        else:
+            shutil.copyfile(source_path, runtime_path)
+
         try:
             os.chmod(runtime_path, 0o600)
         except Exception:
@@ -457,6 +470,8 @@ def _writable_cookiefile_copy(cookie_path: str) -> Optional[str]:
 
         if source_path.startswith("/etc/secrets/"):
             logger.info("Cookies secret copiadas a ruta escribible para yt-dlp: %s", runtime_path)
+        elif source_path.startswith("/tmp/archeon_ytdlp/"):
+            logger.info("Usando cookies ya preparadas en ruta escribible: %s", runtime_path)
 
         return runtime_path
     except Exception as exc:
@@ -9048,4 +9063,3 @@ async def resolve_song(
 
 
 bot.run(TOKEN)
-
