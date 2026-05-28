@@ -410,11 +410,13 @@ ydl_opts = {
     'quiet': True,
     'no_warnings': True,
     'ignoreerrors': True,
+    'ignore_no_formats_error': True,
     'extract_flat': False,
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
     'nocheckcertificate': True,
     'source_address': '0.0.0.0',
+    'logger': QuietYDLLogger(),
     # Mantengo también las keys antiguas porque el bot 18 funcionaba así.
     'geo-bypass': True,
     'geo_bypass': True,
@@ -636,7 +638,8 @@ async def extract_music_with_python_api_bot18(query: str):
     Así evitamos gastar 40+ segundos intentando CLI/EJS antes de llegar al método que sí funcionó.
     """
     is_url = bool(URL_REGEX.match(query))
-    search_value = query if is_url else f"ytsearch:{query}"
+    is_prefixed_search = bool(re.match(r"^(ytsearch|scsearch)\d*:", query, re.IGNORECASE))
+    search_value = query if (is_url or is_prefixed_search) else f"ytsearch:{query}"
 
     cookiefile = get_cookiefile_path()
     attempts = [True, False] if cookiefile else [False]
@@ -650,7 +653,9 @@ async def extract_music_with_python_api_bot18(query: str):
         opts["quiet"] = True
         opts["no_warnings"] = True
         opts["ignoreerrors"] = True
+        opts["ignore_no_formats_error"] = True
         opts["cachedir"] = False
+        opts["logger"] = QuietYDLLogger()
 
         if use_cookies and cookiefile:
             opts["cookiefile"] = cookiefile
@@ -699,16 +704,38 @@ async def extract_music_with_python_api_bot18(query: str):
 async def extract_music_legacy_like_bot18(query: str):
     """Extrae música priorizando velocidad en Render.
 
-    Orden nuevo basado en tus logs:
-    1. API Python estilo bot 18 con cookies primero, que fue la que sí resolvió la canción.
-    2. CLI con Deno/EJS solo como respaldo si YouTube se pone exquisito.
+    Orden actual:
+    1. API Python estilo bot 18 con la búsqueda limpia.
+    2. Variantes simples si el usuario escribió guiones raros o faltó artista.
+    3. SoundCloud como respaldo cuando YouTube activa anti-bot.
+    4. CLI con Deno/EJS como último recurso.
     """
-    try:
-        return await extract_music_with_python_api_bot18(query)
-    except Exception as api_error:
-        logger.warning("API bot18 no pudo resolver '%s'; pruebo CLI EJS: %s", query, str(api_error)[:220])
+    clean_query = _clean_search_query(query)
+    attempts: List[str] = []
 
-    return await extract_music_with_cli_ejs(query)
+    if clean_query:
+        attempts.append(clean_query)
+
+    if clean_query and not URL_REGEX.match(clean_query):
+        # Respaldo más ligero. SoundCloud ayuda cuando YouTube bloquea IPs de Render.
+        attempts.append(f"ytsearch:{clean_query} official audio")
+        attempts.append(f"scsearch5:{clean_query}")
+
+    seen = set()
+    last_error: Optional[BaseException] = None
+    for attempt in attempts:
+        key = attempt.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            return await extract_music_with_python_api_bot18(attempt)
+        except Exception as api_error:
+            last_error = api_error
+            logger.warning("API bot18 no pudo resolver '%s': %s", attempt, str(api_error)[:180])
+
+    logger.warning("API bot18 no pudo resolver '%s'; pruebo CLI EJS: %s", clean_query or query, str(last_error)[:220])
+    return await extract_music_with_cli_ejs(clean_query or query)
 
 
 # --------------------------
@@ -1207,9 +1234,23 @@ class MusicSearchError(Exception):
 
 
 def _clean_search_query(query: str) -> str:
-    """Limpia el texto para búsquedas musicales sin pasarse de listo."""
+    """Limpia el texto para búsquedas musicales sin pasarse de listo.
+
+    Importante para Discord: muchos escriben cosas como
+    `enamorado tuyo -cuarteto de nos`. YouTube interpreta `-cuarteto`
+    como exclusión, así que normalizamos guiones pegados a palabras.
+    No tocamos URLs.
+    """
     query = (query or "").strip()
-    query = re.sub(r"\s+", " ", query)
+    if not query:
+        return ""
+    if URL_REGEX.match(query):
+        return query[:500]
+
+    query = query.replace("—", "-").replace("–", "-")
+    # Convierte "tema -artista", "artista- tema" y "artista - tema" en texto buscable.
+    query = re.sub(r"(?<=\w)\s*-\s*(?=\w)", " ", query)
+    query = re.sub(r"\s+", " ", query).strip()
     return query[:180]
 
 
@@ -7931,4 +7972,3 @@ except Exception as e:
     logger.warning(f"No se pudo iniciar webserver keepalive: {e}")
 
 bot.run(TOKEN)
-
