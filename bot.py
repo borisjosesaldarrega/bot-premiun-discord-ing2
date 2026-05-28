@@ -341,7 +341,46 @@ FFMPEG_AUDIO_OPTIONS = (
     '-ar 48000 '
 )
 
-FFMPEG_EXECUTABLE = os.getenv("FFMPEG_PATH", "ffmpeg")
+def resolve_ffmpeg_executable() -> str:
+    """Elige FFmpeg estable para Render.
+
+    Render native runtimes ya traen `ffmpeg`. El binario de imageio-ffmpeg
+    puede crashear con code -11 en algunos entornos, así que preferimos el
+    ffmpeg del sistema y solo usamos imageio como último respaldo.
+    """
+    prefer_system = os.getenv("PREFER_SYSTEM_FFMPEG", "true").lower() in {"1", "true", "yes", "on"}
+    forced = (os.getenv("FFMPEG_PATH") or "").strip()
+    system_ffmpeg = shutil.which("ffmpeg")
+
+    if prefer_system and system_ffmpeg:
+        return system_ffmpeg
+
+    if forced:
+        return forced
+
+    if system_ffmpeg:
+        return system_ffmpeg
+
+    return "ffmpeg"
+
+
+def ffmpeg_version_line(executable: str) -> str:
+    """Devuelve una línea corta de versión de FFmpeg para diagnóstico."""
+    try:
+        result = subprocess.run(
+            [executable, "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        )
+        return (result.stdout or "").splitlines()[0][:180]
+    except Exception as exc:
+        return f"No pude leer versión de FFmpeg: {exc}"
+
+
+FFMPEG_EXECUTABLE = resolve_ffmpeg_executable()
+logger.info("FFmpeg seleccionado: %s | %s", FFMPEG_EXECUTABLE, ffmpeg_version_line(FFMPEG_EXECUTABLE))
 DEFAULT_GUILD_VOLUME = 0.90
 guild_volumes: Dict[int, float] = {}
 
@@ -1570,7 +1609,7 @@ async def create_audio_source(url: str, guild_id: Optional[int] = None):
     Enviamos PCM limpio y dejamos que discord.py/PyNaCl codifique el audio para Discord.
     Es menos "fancy", pero es más estable en Render.
     """
-    executable = os.getenv("FFMPEG_PATH") or FFMPEG_EXECUTABLE or "ffmpeg"
+    executable = resolve_ffmpeg_executable()
 
     before_options = (
         '-nostdin '
@@ -1587,7 +1626,6 @@ async def create_audio_source(url: str, guild_id: Optional[int] = None):
         '-vn '
         '-ac 2 '
         '-ar 48000 '
-        '-f s16le '
     )
 
     try:
@@ -1598,7 +1636,7 @@ async def create_audio_source(url: str, guild_id: Optional[int] = None):
             executable=executable
         )
         volume = get_guild_volume(guild_id or 0)
-        logger.info("Fuente de audio creada con FFmpeg PCM: %s", executable)
+        logger.info("Fuente de audio creada con FFmpeg PCM: %s | %s", executable, ffmpeg_version_line(executable))
         return discord.PCMVolumeTransformer(raw_source, volume=volume)
     except FileNotFoundError as e:
         raise RuntimeError(
