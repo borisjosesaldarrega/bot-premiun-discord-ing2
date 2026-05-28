@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: archeon-discord-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: false
+    envVars:
+      - key: discord_token
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: STABILITY_API_KEY
+        sync: false
+      - key: AUTO_VOICE_DISCONNECT
+        value: "true"
+      - key: MODERATION_AI_ENABLED
+        value: "false"
+      - key: DJ_USE_GEMINI
+        value: "false"
