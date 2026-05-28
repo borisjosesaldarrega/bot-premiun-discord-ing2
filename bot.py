@@ -46,6 +46,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+class QuietYDLLogger:
+    """Silencia errores internos repetidos de yt-dlp para que Render no parezca incendio.
+
+    El bot sigue guardando un resumen propio en logger.warning cuando una búsqueda falla,
+    pero evita spamear cientos de líneas tipo "Requested format is not available".
+    """
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        text = str(msg)
+        if "Requested format is not available" not in text:
+            logger.debug(f"yt-dlp warning: {text[:250]}")
+
+    def error(self, msg):
+        text = str(msg)
+        # Lo dejamos en debug porque resolve_song ya resume el error de forma controlada.
+        logger.debug(f"yt-dlp error: {text[:250]}")
+
 # Configurar el nivel de logging para librerías específicas
 logging.getLogger('discord').setLevel(logging.WARNING)
 logging.getLogger('google').setLevel(logging.WARNING)
@@ -151,6 +171,40 @@ intents.message_content = True
 intents.voice_states = True
 intents.members = True
 bot = commands.Bot(command_prefix=commands.when_mentioned_or('¡'), intents=intents, help_command=None, heartbeat_timeout=60.0, guild_ready_timeout=10, member_cache_flags=discord.MemberCacheFlags.none(), chunk_guilds_at_startup=False)
+
+
+# --------------------------
+# Tareas asyncio seguras
+# --------------------------
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    """Evita el warning 'Task exception was never retrieved' y deja el error real en logs."""
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.error("No pude leer la excepción de una tarea asyncio:\n%s", traceback.format_exc())
+        return
+
+    if exc:
+        task_name = task.get_name() if hasattr(task, "get_name") else "tarea_asyncio"
+        logger.error("Error en tarea asyncio '%s': %s\n%s", task_name, repr(exc), ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+
+
+def create_logged_task(coro, name: Optional[str] = None) -> asyncio.Task:
+    """Crea tareas en segundo plano con callback de errores.
+
+    Sin esto, Python muestra 'Task exception was never retrieved' cuando una tarea creada
+    con create_task falla y nadie consulta su excepción.
+    """
+    try:
+        task = bot.loop.create_task(coro, name=name)
+    except TypeError:
+        task = bot.loop.create_task(coro)
+
+    task.add_done_callback(_log_task_exception)
+    return task
 log_voice_dependency_status()
 MODERATION_DATA_PATH = "data/moderation_data.json"
 os.makedirs("data", exist_ok=True)
@@ -195,6 +249,19 @@ gemini_moderation_cooldown_until: float = 0.0
 # Si luego quieres que Gemini ayude a sugerir canciones, pon DJ_USE_GEMINI=true en .env.
 DJ_USE_GEMINI = os.getenv("DJ_USE_GEMINI", "false").lower() in {"1", "true", "yes", "on"}
 gemini_dj_cooldown_until: float = 0.0
+
+# Render/hosting cloud: YouTube puede devolver solo formatos SABR o sin audio.
+# En ese caso no queremos spamear logs ni poner cualquier remix; preferimos fallar claro.
+RUNNING_ON_RENDER = bool(os.getenv('RENDER') or os.getenv('RENDER_EXTERNAL_URL') or os.getenv('RENDER_SERVICE_ID'))
+STRICT_MUSIC_MATCH = os.getenv('STRICT_MUSIC_MATCH', 'true').lower() in {'1', 'true', 'yes', 'on'}
+
+# Modo compatibilidad de música:
+# El bot viejo resolvía música de forma simple y rápida:
+# ydl.extract_info("ytsearch:consulta") -> entries[0] -> info["url"]/formats -> FFmpegOpusAudio.from_probe.
+# En Render esa ruta fue la que sí te funcionó. Por eso queda activada primero.
+LEGACY_RENDER_MUSIC_FIRST = os.getenv("LEGACY_RENDER_MUSIC_FIRST", "true").lower() in {"1", "true", "yes", "on"}
+LEGACY_RENDER_AUDIO = os.getenv("LEGACY_RENDER_AUDIO", "true").lower() in {"1", "true", "yes", "on"}
+
 
 # --------------------------
 # Configuración de tickets y bienvenida
@@ -291,6 +358,34 @@ FFMPEG_OPTIONS = {
     # No pasamos subprocess.PIPE: en Python 3.13 da warning y no aporta aquí.
 }
 
+# Opciones heredadas del bot viejo. En Render fueron más estables para voz/música.
+LEGACY_FFMPEG_OPTIONS = {
+    'before_options': (
+        '-reconnect 1 '
+        '-reconnect_streamed 1 '
+        '-reconnect_delay_max 10 '
+        '-loglevel warning '
+        '-user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36" '
+        '-http_persistent 1 '
+        '-multiple_requests 1 '
+        '-fflags +discardcorrupt+fastseek '
+        '-probesize 32 '
+        '-analyzeduration 0 '
+        '-protocol_whitelist file,pipe,udp,rtp,tcp,https,tls '
+        '-hide_banner '
+    ),
+    'options': (
+        '-vn '
+        '-bufsize 512k '
+        '-af dynaudnorm=p=0.5 '
+        '-c:a libopus '
+        '-application lowdelay '
+        '-strict experimental '
+    ),
+    'executable': FFMPEG_EXECUTABLE,
+    'stderr': subprocess.PIPE
+}
+
 # Opciones para yt-dlp.
 # Importante: YouTube a veces devuelve "Sign in to confirm you're not a bot".
 # Por eso buscamos varios resultados, saltamos entradas rotas y usamos SoundCloud como respaldo.
@@ -302,6 +397,8 @@ ydl_opts = {
     'noplaylist': True,
     'quiet': True,
     'no_warnings': True,
+    'logger': QuietYDLLogger(),
+    'ignore_no_formats_error': True,
     'ignoreerrors': True,
     'extract_flat': False,
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
@@ -338,6 +435,231 @@ for cookie_path in cookie_paths:
         ydl_opts["cookiefile"] = cookie_path
         logger.info(f"Usando cookies de YouTube desde: {cookie_path}")
         break
+
+
+# --------------------------
+# Extracción musical robusta para Render/YouTube
+# --------------------------
+
+def _is_youtube_search_or_url(search_query: str) -> bool:
+    """Detecta búsquedas/URLs de YouTube para probar estrategias especiales."""
+    value = str(search_query or "").lower()
+    return (
+        value.startswith("ytsearch")
+        or "youtube.com" in value
+        or "youtu.be" in value
+    )
+
+
+def _safe_ydl_opts(
+    *,
+    use_cookies: bool = False,
+    youtube_clients: Optional[List[str]] = None,
+    label: str = "default",
+) -> Dict:
+    """Crea opciones independientes para yt-dlp sin mutar ydl_opts global.
+
+    Render + YouTube es delicado: a veces las cookies ayudan con "not a bot",
+    pero otras provocan "Requested format is not available". Por eso probamos
+    primero sin cookies y usamos cookies solo como respaldo.
+    """
+    opts = dict(ydl_opts)
+    opts["logger"] = QuietYDLLogger()
+    opts["quiet"] = True
+    opts["no_warnings"] = True
+    opts["ignoreerrors"] = True
+    opts["ignore_no_formats_error"] = True
+    opts["noprogress"] = True
+
+    # No heredar cookies/extractor_args a ciegas.
+    opts.pop("cookiefile", None)
+    opts.pop("extractor_args", None)
+
+    if youtube_clients:
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": youtube_clients
+            }
+        }
+
+    if use_cookies:
+        for cookie_path in cookie_paths:
+            if os.path.exists(cookie_path):
+                opts["cookiefile"] = cookie_path
+                break
+
+    opts["_archeon_strategy"] = label
+    return opts
+
+
+def get_ydl_option_variants(search_query: str) -> List[Dict]:
+    """Devuelve estrategias de extracción en orden de menor a mayor riesgo.
+
+    Lo importante: NO usar cookies de YouTube como primera opción en Render.
+    Hay casos actuales donde cookies válidas causan que YouTube devuelva solo
+    formatos SABR/sin URL y yt-dlp termina con "Requested format is not available".
+    """
+    query = str(search_query or "")
+
+    # SoundCloud y otros extractores: sin cookies de YouTube ni clientes de YouTube.
+    if not _is_youtube_search_or_url(query):
+        return [
+            _safe_ydl_opts(use_cookies=False, youtube_clients=None, label="generic_no_cookies"),
+        ]
+
+    variants = [
+        # 1) Primer intento: limpio, sin cookies. En muchos servidores esto funciona
+        # mejor que cookies exportadas de un navegador local.
+        _safe_ydl_opts(use_cookies=False, youtube_clients=None, label="yt_no_cookies_default"),
+        # 2) Clientes móviles sin cookies: a veces entregan stream de audio cuando web no.
+        _safe_ydl_opts(use_cookies=False, youtube_clients=["android", "ios"], label="yt_no_cookies_mobile"),
+        # 3) Cliente web/tv sin cookies.
+        _safe_ydl_opts(use_cookies=False, youtube_clients=["default", "web", "tv"], label="yt_no_cookies_web_tv"),
+    ]
+
+    # 4) Cookies como respaldo, no como primera opción.
+    if any(os.path.exists(cookie_path) for cookie_path in cookie_paths):
+        variants.extend([
+            _safe_ydl_opts(use_cookies=True, youtube_clients=None, label="yt_cookies_default"),
+            _safe_ydl_opts(use_cookies=True, youtube_clients=["default", "web", "tv"], label="yt_cookies_web_tv"),
+            _safe_ydl_opts(use_cookies=True, youtube_clients=["android", "ios"], label="yt_cookies_mobile"),
+        ])
+
+    return variants
+
+
+def _entry_has_playable_audio(entry: Dict) -> bool:
+    """Revisa rápido si el resultado trae URL de audio reproducible."""
+    try:
+        get_best_audio_url(entry)
+        return True
+    except Exception:
+        return False
+
+
+
+def get_cookiefile_path() -> Optional[str]:
+    """Devuelve la ruta real de cookies para local o Render, si existe."""
+    for cookie_path in ("cookies.txt", "/etc/secrets/cookies.txt"):
+        if os.path.exists(cookie_path):
+            return cookie_path
+    return None
+
+
+def build_legacy_ydl_opts() -> Dict:
+    """Opciones del bot viejo, pero con ruta de cookies compatible con Render.
+
+    Esta ruta es intencionalmente sencilla porque fue la que te funcionaba:
+    - format=bestaudio/best
+    - ytsearch:consulta
+    - entries[0]
+    - info["url"] o primer formato con audio
+    """
+    opts = {
+        'format': 'bestaudio/best',
+        'default_search': 'ytsearch',
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'logger': QuietYDLLogger(),
+        'ignoreerrors': True,
+        'extract_flat': False,
+        'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+        'restrictfilenames': True,
+        'nocheckcertificate': True,
+        'source_address': '0.0.0.0',
+        'geo_bypass': True,
+        'cachedir': False,
+    }
+
+    cookie_path = get_cookiefile_path()
+    if cookie_path:
+        opts['cookiefile'] = cookie_path
+
+    return opts
+
+
+def _legacy_pick_first_entry(info) -> Dict:
+    """Imita al bot viejo: si hay entries, usa la primera entrada válida."""
+    if not info:
+        raise MusicSearchError("yt-dlp no devolvió información de la canción.")
+
+    if isinstance(info, dict) and 'entries' in info:
+        entries = [entry for entry in (info.get('entries') or []) if isinstance(entry, dict)]
+        if not entries:
+            raise MusicSearchError("yt-dlp no devolvió resultados válidos.")
+        return entries[0]
+
+    if isinstance(info, dict):
+        return info
+
+    raise MusicSearchError("Respuesta inválida de yt-dlp.")
+
+
+def _legacy_get_audio_url(info: Dict) -> str:
+    """Imita el extractor del bot viejo: info['url'] primero, luego formats con audio."""
+    if info.get('url'):
+        return info['url']
+
+    formats = info.get('formats') or []
+    for fmt in formats:
+        if isinstance(fmt, dict) and fmt.get('url') and fmt.get('acodec') != 'none':
+            return fmt['url']
+
+    for fmt in formats:
+        if isinstance(fmt, dict) and fmt.get('url'):
+            return fmt['url']
+
+    raise MusicSearchError("El resultado no trae URL de audio reproducible.")
+
+
+async def resolve_song_legacy_fast(
+    busqueda: str,
+    requested_by,
+    *,
+    max_duration: Optional[int] = None,
+    exclude_markers: Optional[Set[str]] = None,
+) -> Dict:
+    """Ruta rápida heredada del bot 18.
+
+    Se ejecuta antes de la lógica nueva para recuperar el comportamiento que sí funcionaba
+    en Render: búsqueda instantánea y extracción directa.
+    """
+    query = _clean_search_query(busqueda)
+    if not query:
+        raise MusicSearchError("Escribe el nombre o enlace de una canción.")
+
+    is_url = bool(URL_REGEX.match(query))
+    search_query = query if is_url else f"ytsearch:{query}"
+    exclude_markers = set(exclude_markers or set())
+
+    with youtube_dl.YoutubeDL(build_legacy_ydl_opts()) as ydl:
+        info = await extract_info_async(ydl, search_query, download=False)
+
+    entry = _legacy_pick_first_entry(info)
+
+    duration = _safe_int(entry.get("duration"), 0)
+    if max_duration and duration and duration > max_duration:
+        raise MusicSearchError("La canción supera la duración máxima permitida.")
+
+    audio_url = _legacy_get_audio_url(entry)
+
+    song = {
+        "title": str(entry.get("title") or query)[:100],
+        "url": audio_url,
+        "web_url": entry.get("webpage_url") or entry.get("original_url") or query,
+        "duration": duration,
+        "requested_by": requested_by,
+        "thumbnail": entry.get("thumbnail") or "https://i.imgur.com/8Km9tLL.png",
+        "uploader": str(entry.get("uploader") or entry.get("channel") or "Artista desconocido")[:80],
+    }
+
+    if exclude_markers and (song_markers(song) & exclude_markers):
+        raise MusicSearchError("La canción ya está sonando, en cola o fue usada recientemente.")
+
+    logger.info("Canción resuelta con modo legacy rápido: %s", song["title"])
+    return song
+
 
 # --------------------------
 # Funciones auxiliares
@@ -1004,7 +1326,7 @@ def ensure_dj_auto_task(guild: discord.Guild) -> None:
     task = dj_auto_tasks.get(guild.id)
     if task and not task.done():
         return
-    dj_auto_tasks[guild.id] = bot.loop.create_task(auto_add_songs_task(guild))
+    dj_auto_tasks[guild.id] = create_logged_task(auto_add_songs_task(guild), f"dj_auto_add_{guild.id}")
 
 
 def _is_youtube_bot_check_error(error: BaseException) -> bool:
@@ -1020,6 +1342,40 @@ def _is_youtube_bot_check_error(error: BaseException) -> bool:
 def _query_wants_version(query: str, word: str) -> bool:
     """Devuelve True si el usuario pidió explícitamente una versión tipo remix/live/etc."""
     return word.lower() in str(query or "").lower()
+
+
+def _music_tokens(text: str) -> Set[str]:
+    """Tokens limpios para comparar búsqueda vs resultado."""
+    cleaned = _strip_music_noise(text).lower()
+    return {
+        t for t in re.findall(r"[a-z0-9áéíóúüñ]+", cleaned)
+        if len(t) > 1 and t not in {"oficial", "official", "audio", "video", "lyrics", "letra", "the", "and", "feat", "ft"}
+    }
+
+
+def _music_match_ratio(info: Dict, query: str) -> float:
+    """Qué tanto coincide el resultado con lo pedido. 1.0 = casi exacto."""
+    q_tokens = _music_tokens(query)
+    if not q_tokens:
+        return 0.0
+    title = str(info.get("title") or "")
+    uploader = str(info.get("uploader") or info.get("channel") or "")
+    result_tokens = _music_tokens(f"{title} {uploader}")
+    if not result_tokens:
+        return 0.0
+    return len(q_tokens & result_tokens) / max(1, len(q_tokens))
+
+
+def _is_too_weak_music_match(info: Dict, query: str) -> bool:
+    """Evita que Render/SoundCloud pongan 'algo parecido' cuando el usuario pidió una canción concreta."""
+    if not STRICT_MUSIC_MATCH:
+        return False
+    if URL_REGEX.match(str(query or "")):
+        return False
+    ratio = _music_match_ratio(info, query)
+    # Para búsquedas cortas como "julieta latin mafia" exigimos casi todo.
+    # Así no pone remixes raros ni canciones con solo una palabra en común.
+    return ratio < 0.66
 
 
 def _is_unwanted_music_version(info: Dict, query: str) -> bool:
@@ -1197,12 +1553,22 @@ def get_guild_volume(guild_id: int) -> float:
 
 
 async def create_audio_source(url: str, guild_id: Optional[int] = None):
-    """Crea una fuente de audio audible y controlable por volumen.
+    """Crea fuente de audio.
 
-    Usamos FFmpegPCMAudio + PCMVolumeTransformer porque permite cambiar volumen en caliente.
-    Si ffmpeg no está instalado, el error se vuelve claro para el usuario.
+    En Render usamos primero la ruta vieja con FFmpegOpusAudio.from_probe porque fue
+    la que sí reproducía. Si falla, vuelve al método nuevo con volumen controlable.
     """
     try:
+        if LEGACY_RENDER_AUDIO:
+            try:
+                return await discord.FFmpegOpusAudio.from_probe(
+                    url,
+                    method='fallback',
+                    **LEGACY_FFMPEG_OPTIONS
+                )
+            except Exception as legacy_error:
+                logger.warning("Audio legacy falló, intento PCMVolumeTransformer: %s", str(legacy_error)[:180])
+
         raw_source = discord.FFmpegPCMAudio(
             url,
             before_options=FFMPEG_BEFORE_OPTIONS,
@@ -1217,8 +1583,16 @@ async def create_audio_source(url: str, guild_id: Optional[int] = None):
             "reinicia PowerShell/VS Code y prueba `ffmpeg -version`."
         ) from e
 
+
 def build_music_searches(busqueda: str) -> List[str]:
-    """Arma búsquedas más precisas para evitar remixes y resultados falsos."""
+    """Arma búsquedas precisas y respaldos sin poner remixes por accidente.
+
+    En Render YouTube puede bloquear formatos. Por eso hacemos:
+    1) YouTube exacto.
+    2) YouTube oficial.
+    3) SoundCloud exacto como respaldo.
+    4) Variantes de letra/video solo si hace falta.
+    """
     query = _clean_search_query(busqueda)
     if not query:
         return []
@@ -1229,23 +1603,24 @@ def build_music_searches(busqueda: str) -> List[str]:
     q_lower = query.lower()
     wants_alt_version = any(
         word in q_lower
-        for word in ("remix", "cover", "live", "en vivo", "slowed", "karaoke", "instrumental")
+        for word in ("remix", "cover", "live", "en vivo", "slowed", "karaoke", "instrumental", "sped up", "reverb")
     )
 
+    # YouTube sí interpreta algunos negativos en búsqueda. No es perfecto, pero ayuda.
     negative = ""
     if not wants_alt_version:
-        negative = " -remix -cover -slowed -reverb -karaoke -live -instrumental -nightcore"
+        negative = " -remix -cover -slowed -reverb -karaoke -live -instrumental -nightcore -sped -tiktok"
 
     searches = [
-        f"ytsearch20:{query}{negative}",
-        f"ytsearch20:{query} official audio{negative}",
-        f"ytsearch20:{query} audio oficial{negative}",
-        f"ytsearch20:{query} official video{negative}",
-        f"ytsearch20:{query} video oficial{negative}",
-        f"ytsearch20:{query} lyrics{negative}",
-        f"ytsearch20:{query} letra{negative}",
-        # SoundCloud queda al final. También se filtra para evitar remixes no pedidos.
+        f"ytsearch15:{query}{negative}",
+        f"ytsearch15:{query} official audio{negative}",
+        f"ytsearch15:{query} audio oficial{negative}",
+        f"ytsearch15:{query} official video{negative}",
+        f"ytsearch15:{query} video oficial{negative}",
+        # Respaldo exacto antes de búsquedas más flojas.
         f"scsearch10:{query}",
+        f"ytsearch10:{query} lyrics{negative}",
+        f"ytsearch10:{query} letra{negative}",
     ]
 
     unique = []
@@ -1255,7 +1630,6 @@ def build_music_searches(busqueda: str) -> List[str]:
             unique.append(item)
             seen.add(item)
     return unique
-
 
 def _format_music_error(query: str, bot_blocked: bool = False) -> str:
     if bot_blocked:
@@ -1267,7 +1641,8 @@ def _format_music_error(query: str, bot_blocked: bool = False) -> str:
 
     return (
         f"No pude obtener audio reproducible para `{query}`. "
-        "Prueba con el nombre completo, añade el artista o pega el enlace directo."
+        "Render/YouTube no entregó un stream de audio válido. Prueba pegando el enlace directo, "
+        "añade artista + canción exacta o intenta una fuente de SoundCloud."
     )
 
 
@@ -1281,76 +1656,116 @@ async def resolve_song(
     """
     Busca una canción y devuelve un diccionario normalizado para la cola.
 
-    Si exclude_markers viene lleno, salta resultados que ya están sonando,
-    ya están en cola o sonaron recientemente en modo DJ.
+    Corrección final:
+    1) Primero usa el método del bot 18, porque fue el que en Render encontraba y reproducía rápido.
+    2) Si ese método falla, usa la lógica nueva como respaldo.
     """
     query = _clean_search_query(busqueda)
     if not query:
         raise MusicSearchError("Escribe el nombre o enlace de una canción.")
 
-    searches = build_music_searches(query)
+    exclude_markers = set(exclude_markers or set())
     bot_blocked = False
     last_errors: List[str] = []
-    exclude_markers = set(exclude_markers or set())
+
+    if LEGACY_RENDER_MUSIC_FIRST:
+        try:
+            return await resolve_song_legacy_fast(
+                query,
+                requested_by,
+                max_duration=max_duration,
+                exclude_markers=exclude_markers,
+            )
+        except Exception as legacy_error:
+            if _is_youtube_bot_check_error(legacy_error):
+                bot_blocked = True
+            last_errors.append(f"legacy_fast: {str(legacy_error)[:180]}")
+            logger.warning("Modo legacy rápido falló para '%s': %s", query, str(legacy_error)[:220])
+
+    searches = build_music_searches(query)
 
     for search_query in searches:
-        try:
-            with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-                info = await extract_info_async(ydl, search_query, download=False)
+        variants = get_ydl_option_variants(search_query)
 
-            entries = sorted(
-                _iter_ydl_entries(info),
-                key=lambda item: _score_music_candidate(item, query),
-                reverse=True
-            )
+        for ydl_variant in variants:
+            strategy = ydl_variant.get("_archeon_strategy", "default")
+            ydl_run_opts = dict(ydl_variant)
+            ydl_run_opts.pop("_archeon_strategy", None)
 
-            if not entries:
-                last_errors.append(f"{search_query}: sin entradas válidas")
-                continue
+            try:
+                with youtube_dl.YoutubeDL(ydl_run_opts) as ydl:
+                    info = await extract_info_async(ydl, search_query, download=False)
 
-            for entry in entries:
-                try:
-                    if _is_unwanted_music_version(entry, query):
-                        last_errors.append(
-                            f"{search_query}: versión no pedida saltada ({str(entry.get('title') or '')[:70]})"
-                        )
-                        continue
+                entries = sorted(
+                    _iter_ydl_entries(info),
+                    key=lambda item: _score_music_candidate(item, query),
+                    reverse=True
+                )
 
-                    duration = _safe_int(entry.get("duration"), 0)
-                    if max_duration and duration and duration > max_duration:
-                        continue
-
-                    audio_url = get_best_audio_url(entry)
-                    title = str(entry.get("title") or query)[:100]
-                    song = {
-                        "title": title,
-                        "url": audio_url,
-                        "web_url": entry.get("webpage_url") or entry.get("original_url") or entry.get("url") or query,
-                        "duration": duration,
-                        "requested_by": requested_by,
-                        "thumbnail": entry.get("thumbnail") or "https://i.imgur.com/8Km9tLL.png",
-                        "uploader": str(entry.get("uploader") or entry.get("channel") or "Artista desconocido")[:80]
-                    }
-
-                    if exclude_markers and (song_markers(song) & exclude_markers):
-                        last_errors.append(f"{search_query}: resultado repetido saltado ({title[:60]})")
-                        continue
-
-                    return song
-                except Exception as inner_error:
-                    if _is_youtube_bot_check_error(inner_error):
-                        bot_blocked = True
-                    last_errors.append(f"{search_query}: {str(inner_error)[:160]}")
+                if not entries:
+                    last_errors.append(f"{search_query} [{strategy}]: sin entradas válidas")
                     continue
 
-        except Exception as e:
-            if _is_youtube_bot_check_error(e):
-                bot_blocked = True
-            last_errors.append(f"{search_query}: {str(e)[:160]}")
-            logger.warning(f"Búsqueda musical fallida [{search_query}]: {e}")
-            continue
+                for entry in entries:
+                    try:
+                        title_preview = str(entry.get('title') or '')[:80]
 
-    logger.warning("No se resolvió canción '%s'. Errores: %s", query, " | ".join(last_errors[-6:]))
+                        # En el respaldo sí evitamos versiones raras, pero solo después de haber probado legacy.
+                        if _is_unwanted_music_version(entry, query):
+                            last_errors.append(
+                                f"{search_query} [{strategy}]: versión no pedida saltada ({title_preview})"
+                            )
+                            continue
+
+                        duration = _safe_int(entry.get("duration"), 0)
+                        if max_duration and duration and duration > max_duration:
+                            last_errors.append(
+                                f"{search_query} [{strategy}]: duración excedida ({title_preview})"
+                            )
+                            continue
+
+                        try:
+                            audio_url = get_best_audio_url(entry)
+                        except Exception as audio_error:
+                            if _is_youtube_bot_check_error(audio_error):
+                                bot_blocked = True
+                            last_errors.append(
+                                f"{search_query} [{strategy}]: sin audio reproducible ({title_preview})"
+                            )
+                            continue
+
+                        title = str(entry.get("title") or query)[:100]
+                        song = {
+                            "title": title,
+                            "url": audio_url,
+                            "web_url": entry.get("webpage_url") or entry.get("original_url") or entry.get("url") or query,
+                            "duration": duration,
+                            "requested_by": requested_by,
+                            "thumbnail": entry.get("thumbnail") or "https://i.imgur.com/8Km9tLL.png",
+                            "uploader": str(entry.get("uploader") or entry.get("channel") or "Artista desconocido")[:80]
+                        }
+
+                        if exclude_markers and (song_markers(song) & exclude_markers):
+                            last_errors.append(f"{search_query} [{strategy}]: resultado repetido saltado ({title[:60]})")
+                            continue
+
+                        logger.info("Canción resuelta con respaldo %s: %s", strategy, title)
+                        return song
+
+                    except Exception as inner_error:
+                        if _is_youtube_bot_check_error(inner_error):
+                            bot_blocked = True
+                        last_errors.append(f"{search_query} [{strategy}]: {str(inner_error)[:160]}")
+                        continue
+
+            except Exception as e:
+                if _is_youtube_bot_check_error(e):
+                    bot_blocked = True
+                last_errors.append(f"{search_query} [{strategy}]: {str(e)[:160]}")
+                logger.warning(f"Búsqueda musical fallida [{search_query}] estrategia [{strategy}]: {e}")
+                continue
+
+    logger.warning("No se resolvió canción '%s'. Errores: %s", query, " | ".join(last_errors[-10:]))
     raise MusicSearchError(_format_music_error(query, bot_blocked=bot_blocked))
 
 
@@ -1570,7 +1985,7 @@ async def music_voice_watchdog():
                 channel = guild.get_channel(channel_id) if channel_id else None
                 if channel:
                     logger.warning(f"Watchdog: detecté música activa sin voz en {guild.name}; intento reconectar.")
-                    bot.loop.create_task(recover_music_after_disconnect(guild, channel))
+                    create_logged_task(recover_music_after_disconnect(guild, channel), f"recover_music_{guild.id}")
 
             except Exception:
                 logger.error(f"Error en music_voice_watchdog: {traceback.format_exc()}")
@@ -6415,7 +6830,7 @@ async def on_ready():
     import signal
     def handle_signal(signum, frame):
         logger.info(f"Recibida señal {signum}, cerrando limpiamente...")
-        asyncio.create_task(bot.close())
+        create_logged_task(bot.close(), "bot_close_signal")
     
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
@@ -6488,9 +6903,9 @@ async def on_ready():
                     logger.error(f"Error en tarea en segundo plano {task_func.__name__}: {e}")
                     await asyncio.sleep(60)  # Esperar antes de reintentar
 
-        bot.loop.create_task(safe_background_task(check_empty_voice_channels))
-        bot.loop.create_task(safe_background_task(music_voice_watchdog))
-        bot.loop.create_task(safe_background_task(save_data_periodically))
+        create_logged_task(safe_background_task(check_empty_voice_channels), "check_empty_voice_channels")
+        create_logged_task(safe_background_task(music_voice_watchdog), "music_voice_watchdog")
+        create_logged_task(safe_background_task(save_data_periodically), "save_data_periodically")
         bot.background_tasks_started = True
         logger.info("Tareas en segundo plano iniciadas con manejo seguro")
     else:
@@ -6736,7 +7151,7 @@ async def on_voice_state_update(member, before, after):
 
         if active_state:
             last_voice_channel_ids[guild_id] = before.channel.id
-            bot.loop.create_task(recover_music_after_disconnect(before.channel.guild, before.channel))
+            create_logged_task(recover_music_after_disconnect(before.channel.guild, before.channel), f"recover_music_voice_state_{guild_id}")
             return
 
         # Solo limpiamos cuando no hay nada activo.
