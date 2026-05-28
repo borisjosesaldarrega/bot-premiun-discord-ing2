@@ -9063,21 +9063,25 @@ async def resolve_song(
 
 
 
+
 # ================================================================
-# PARCHE FINAL DZKNIGHT: búsqueda rápida + URL exacta
+# PARCHE FINAL DZKNIGHT: búsqueda rápida + URL exacta + candidatos filtrados
 # ================================================================
 # Objetivo:
-# - Si el usuario pega un link, se intenta reproducir ESE link y variantes del mismo video.
-# - Si el usuario escribe texto, se hacen menos búsquedas y sin negativos largos.
-# - Se filtra basura después de obtener candidatos, no dentro del texto de búsqueda.
-# - Se cachean resoluciones cortas para que repetir canciones sea instantáneo.
+# - URL = URL exacta/variantes del mismo video. No busca por título alternativo.
+# - Texto = búsqueda rápida, pero revisa varios candidatos antes de rendirse.
+# - Si el primer resultado es remix/karaoke/cosa rara, no mata toda la búsqueda:
+#   sigue con el siguiente resultado.
+# - Para Render, las búsquedas de texto prueban SIN cookies primero porque en tus logs
+#   suele resolver más rápido; las URLs prueban cookies y sin cookies.
+# - Caché corta para repetir canciones casi instantáneo.
 
 _FAST_MUSIC_CACHE: Dict[str, Dict[str, Union[float, Dict, str]]] = {}
 _FAST_CACHE_TTL = int(os.getenv("MUSIC_CACHE_TTL", "600"))
-_FAST_YTDLP_TIMEOUT = int(os.getenv("YTDLP_FAST_TIMEOUT", os.getenv("YTDLP_API_TIMEOUT", "10")))
-_FAST_SEARCH_LIMIT = int(os.getenv("MUSIC_SEARCH_LIMIT", "3"))
-_FAST_TRY_NO_COOKIES = os.getenv("YTDLP_TRY_NO_COOKIES", "false").lower() in {"1", "true", "yes", "on"}
-_FAST_MAX_ATTEMPTS = int(os.getenv("MUSIC_MAX_ATTEMPTS", "3"))
+_FAST_YTDLP_TIMEOUT = int(os.getenv("YTDLP_FAST_TIMEOUT", os.getenv("YTDLP_API_TIMEOUT", "9")))
+_FAST_SEARCH_LIMIT = int(os.getenv("MUSIC_SEARCH_LIMIT", "5"))
+_FAST_TRY_NO_COOKIES = os.getenv("YTDLP_TRY_NO_COOKIES", "true").lower() in {"1", "true", "yes", "on"}
+_FAST_MAX_ATTEMPTS = int(os.getenv("MUSIC_MAX_ATTEMPTS", "4"))
 
 
 def _fast_cache_key(query: str) -> str:
@@ -9108,55 +9112,136 @@ def _set_fast_cached(query: str, info: Dict, audio_url: str) -> None:
         "info": dict(info),
         "audio_url": str(audio_url),
     }
-    # Limpieza barata para que no crezca sin control.
-    if len(_FAST_MUSIC_CACHE) > 80:
-        oldest = sorted(_FAST_MUSIC_CACHE.items(), key=lambda kv: float(kv[1].get("time", 0)))[:20]
+    if len(_FAST_MUSIC_CACHE) > 100:
+        oldest = sorted(_FAST_MUSIC_CACHE.items(), key=lambda kv: float(kv[1].get("time", 0)))[:25]
         for k, _ in oldest:
             _FAST_MUSIC_CACHE.pop(k, None)
+
+
+def _remove_trailing_music_punctuation(query: str) -> str:
+    """Quita puntos finales raros sin tocar URLs."""
+    q = str(query or "").strip()
+    if URL_REGEX.match(q):
+        return q
+    return re.sub(r"[.。]+$", "", q).strip()
+
+
+def _query_variants_for_text(query: str) -> List[str]:
+    """Variantes cortas para casos reales como 'mucho ruido latin mafia'.
+
+    No usamos IA ni búsquedas enormes: solo variantes obvias y baratas.
+    """
+    q = _remove_trailing_music_punctuation(_clean_search_query(query))
+    if not q:
+        return []
+
+    variants: List[str] = [q]
+    q_low = q.lower()
+
+    # Caso real del log: el tema oficial se llama "tengo mucho ruido",
+    # pero el usuario puede pedir "mucho ruido latin mafia".
+    if "mucho ruido" in q_low and "tengo mucho ruido" not in q_low:
+        variants.append(re.sub(r"(?i)\bmucho ruido\b", "tengo mucho ruido", q))
+        if "latin mafia" in q_low:
+            variants.append("LATIN MAFIA tengo mucho ruido")
+            variants.append("tengo mucho ruido LATIN MAFIA")
+
+    # Si viene "Artista - Canción", probar también "Canción Artista".
+    parts = [p.strip() for p in re.split(r"\s+[-–—|]\s+", q) if p.strip()]
+    if len(parts) >= 2:
+        variants.append(f"{parts[1]} {parts[0]}")
+
+    unique: List[str] = []
+    seen = set()
+    for item in variants:
+        clean = _remove_trailing_music_punctuation(_clean_search_query(item))
+        key = clean.lower()
+        if clean and key not in seen:
+            unique.append(clean)
+            seen.add(key)
+    return unique[:4]
 
 
 def build_music_searches(busqueda: str) -> List[str]:
     """Búsquedas rápidas para play normal.
 
-    Antes se usaban búsquedas enormes tipo:
-    ytsearch6:canción -remix -cover -slowed ...
-    Eso en Render/YouTube suele tardar más y a veces devuelve cero entradas.
-    Ahora buscamos corto y filtramos después con _is_unwanted_music_version().
+    Antes se buscaba con negativos largos: -remix -cover -karaoke...
+    Eso hace que YouTube/Render tarde más y a veces devuelva cero entradas.
+    Ahora buscamos limpio y filtramos candidatos después.
     """
-    query = _clean_search_query(busqueda)
+    query = _remove_trailing_music_punctuation(_clean_search_query(busqueda))
     if not query:
         return []
 
     if _query_is_direct_url(query):
         return [query]
 
-    searches = [
-        f"ytsearch{max(1, min(_FAST_SEARCH_LIMIT, 5))}:{query}",
-        f"scsearch{max(3, min(_FAST_SEARCH_LIMIT + 2, 6))}:{query}",
-        f"ytsearch{max(1, min(_FAST_SEARCH_LIMIT, 5))}:{query} official audio",
-    ]
+    n = max(3, min(_FAST_SEARCH_LIMIT, 6))
+    searches: List[str] = []
 
-    # Solo añade official video si el usuario no encontró nada en los intentos rápidos.
-    # Mantenerlo como intento 4 opcional evita tardanzas eternas.
-    if _FAST_MAX_ATTEMPTS >= 4:
-        searches.append(f"ytsearch{max(1, min(_FAST_SEARCH_LIMIT, 5))}:{query} official video")
+    for variant in _query_variants_for_text(query):
+        searches.append(f"ytsearch{n}:{variant}")
+        searches.append(f"ytsearch{n}:{variant} official audio")
+
+    # SoundCloud queda como respaldo liviano, no como primera opción.
+    # En Render a veces salva cuando YouTube no entrega audio.
+    for variant in _query_variants_for_text(query)[:2]:
+        searches.append(f"scsearch{max(3, min(n, 6))}:{variant}")
+
+    if _FAST_MAX_ATTEMPTS >= 5:
+        for variant in _query_variants_for_text(query)[:1]:
+            searches.append(f"ytsearch{n}:{variant} official video")
 
     unique, seen = [], set()
-    for item in searches[:max(1, _FAST_MAX_ATTEMPTS)]:
+    for item in searches:
         key = item.lower()
         if key not in seen:
             unique.append(item)
             seen.add(key)
+        if len(unique) >= max(1, _FAST_MAX_ATTEMPTS):
+            break
     return unique
 
 
-async def _extract_music_old_brutal(query: str, *, search_limit: int = 1):
-    """Extractor rápido estilo bot viejo, pero con timeouts cortos y menos intentos.
+def _candidate_reject_reason(info: Dict, clean_query: str) -> Optional[str]:
+    """Razón por la que NO debe usarse un candidato de búsqueda normal."""
+    if not isinstance(info, dict):
+        return "candidato inválido"
 
-    - URL: se pasa tal cual a yt-dlp.
-    - Texto: ytsearchN.
-    - YouTube en Render: cookies primero.
-    - SoundCloud: sin cookies.
+    if _is_unwanted_music_version(info, clean_query):
+        return f"versión no pedida: {info.get('title')}"
+
+    if _is_too_weak_music_match(info, clean_query):
+        return f"coincidencia débil: {info.get('title')}"
+
+    return None
+
+
+def _attempt_cookie_order(*, is_url: bool, is_soundcloud: bool, cookiefile: Optional[str]) -> List[bool]:
+    """Orden de cookies optimizado para lo que mostraron tus logs."""
+    if is_soundcloud:
+        return [False]
+    if not cookiefile:
+        return [False]
+
+    # Para URL exacta: primero cookies porque algunos videos directos las necesitan.
+    if is_url:
+        return [True, False]
+
+    # Para texto: tus logs muestran que cookies muchas veces falla/lentifica y sin cookies resuelve.
+    return [False, True] if _FAST_TRY_NO_COOKIES else [True]
+
+
+async def _extract_music_old_brutal(
+    query: str,
+    *,
+    search_limit: int = 1,
+    clean_query_for_filter: Optional[str] = None,
+):
+    """Extractor rápido estilo bot viejo, pero revisando varios candidatos.
+
+    El bug anterior era que tomaba el primer resultado con audio. Si ese era remix,
+    se rechazaba y no probaba el segundo/tercer resultado. Ahora sí recorre entradas.
     """
     raw_query = str(query or "").strip()
     if not raw_query:
@@ -9168,18 +9253,15 @@ async def _extract_music_old_brutal(query: str, *, search_limit: int = 1):
 
     is_url = bool(URL_REGEX.match(raw_query))
     is_prefixed = bool(re.match(r"^(ytsearch|scsearch)\d*:", raw_query, re.IGNORECASE))
-    search_value = raw_query if (is_url or is_prefixed) else f"ytsearch{max(1, min(search_limit, 5))}:{raw_query}"
+    search_value = raw_query if (is_url or is_prefixed) else f"ytsearch{max(1, min(search_limit, 6))}:{raw_query}"
     is_soundcloud = search_value.lower().startswith("scsearch") or "soundcloud.com" in search_value.lower()
 
     cookiefile = get_cookiefile_path()
-    if is_soundcloud:
-        attempts = [False]
-    elif cookiefile:
-        attempts = [True, False] if _FAST_TRY_NO_COOKIES else [True]
-    else:
-        attempts = [False]
+    attempts = _attempt_cookie_order(is_url=is_url, is_soundcloud=is_soundcloud, cookiefile=cookiefile)
 
     last_error = None
+    rejected: List[str] = []
+
     for use_cookies in attempts:
         opts = dict(ydl_opts)
         opts.pop("cookiefile", None)
@@ -9211,15 +9293,25 @@ async def _extract_music_old_brutal(query: str, *, search_limit: int = 1):
 
             for entry in entries:
                 audio_url = _pick_audio_url_from_info(entry)
-                if audio_url:
-                    logger.info(
-                        "Extractor rápido resolvió (%s): %s",
-                        "cookies" if use_cookies else "sin cookies",
-                        str(entry.get("title") or raw_query)[:110],
-                    )
-                    _set_fast_cached(raw_query, entry, audio_url)
-                    return entry, audio_url
+                if not audio_url:
+                    continue
 
+                if clean_query_for_filter and not is_url:
+                    reason = _candidate_reject_reason(entry, clean_query_for_filter)
+                    if reason:
+                        rejected.append(reason[:120])
+                        continue
+
+                logger.info(
+                    "Extractor rápido resolvió (%s): %s",
+                    "cookies" if use_cookies else "sin cookies",
+                    str(entry.get("title") or raw_query)[:110],
+                )
+                _set_fast_cached(raw_query, entry, audio_url)
+                return entry, audio_url
+
+            if rejected:
+                raise MusicSearchError("Candidatos rechazados: " + " | ".join(rejected[:3]))
             raise MusicSearchError("yt-dlp devolvió entradas, pero ninguna con audio.")
         except Exception as exc:
             last_error = exc
@@ -9227,7 +9319,7 @@ async def _extract_music_old_brutal(query: str, *, search_limit: int = 1):
                 "Extractor rápido falló para '%s' (%s): %s",
                 raw_query[:110],
                 "cookies" if use_cookies else "sin cookies",
-                str(exc)[:160],
+                str(exc)[:180],
             )
 
     raise MusicSearchError(str(last_error or "Extractor rápido no pudo resolver audio."))
@@ -9237,10 +9329,10 @@ async def extract_music_legacy_like_bot18(query: str):
     """Extractor final rápido.
 
     Link = link exacto/variantes del mismo video. No busca por título alternativo.
-    Texto = pocas búsquedas, primero directo, luego SoundCloud, luego official audio.
+    Texto = pocas búsquedas, revisando varios candidatos por búsqueda.
     """
     raw_query = str(query or "").strip().strip("<>")
-    clean_query = _clean_search_query(raw_query)
+    clean_query = _remove_trailing_music_punctuation(_clean_search_query(raw_query))
 
     if _query_is_direct_url(raw_query) or _query_is_direct_url(clean_query):
         last_error = None
@@ -9249,25 +9341,28 @@ async def extract_music_legacy_like_bot18(query: str):
                 return await _extract_music_old_brutal(variant, search_limit=1)
             except Exception as exc:
                 last_error = exc
-                logger.warning("URL exacta falló '%s': %s", variant[:120], str(exc)[:160])
+                logger.warning("URL exacta falló '%s': %s", variant[:120], str(exc)[:180])
         raise MusicSearchError(str(last_error or "No pude resolver esa URL exacta."))
 
     last_error = None
     for attempt in build_music_searches(clean_query):
         try:
-            info, audio_url = await _extract_music_old_brutal(attempt, search_limit=_FAST_SEARCH_LIMIT)
-            if _is_unwanted_music_version(info, clean_query):
-                raise MusicSearchError(f"Versión no pedida: {info.get('title')}")
-            if _is_too_weak_music_match(info, clean_query):
-                raise MusicSearchError(f"Coincidencia débil: {info.get('title')}")
-            return info, audio_url
+            return await _extract_music_old_brutal(
+                attempt,
+                search_limit=_FAST_SEARCH_LIMIT,
+                clean_query_for_filter=clean_query,
+            )
         except Exception as exc:
             last_error = exc
-            logger.warning("Búsqueda rápida falló '%s': %s", attempt[:120], str(exc)[:160])
+            logger.warning("Búsqueda rápida falló '%s': %s", attempt[:120], str(exc)[:180])
 
-    # CLI/EJS solo como última bala. Timeout corto para que no se quede pensando un siglo.
-    logger.warning("Búsqueda rápida no resolvió '%s'; pruebo CLI EJS corto: %s", clean_query, str(last_error)[:160])
-    return await extract_music_with_cli_ejs(clean_query)
+    # Último intento: CLI/EJS corto, pero todavía filtrando el resultado.
+    logger.warning("Búsqueda rápida no resolvió '%s'; pruebo CLI EJS corto: %s", clean_query, str(last_error)[:180])
+    info, audio_url = await extract_music_with_cli_ejs(clean_query)
+    reason = _candidate_reject_reason(info, clean_query)
+    if reason:
+        raise MusicSearchError(reason)
+    return info, audio_url
 
 
 async def resolve_song(
@@ -9277,9 +9372,9 @@ async def resolve_song(
     max_duration: Optional[int] = None,
     exclude_markers: Optional[Set[str]] = None,
 ) -> Dict:
-    """Resolve final rápido: URL exacta, texto con filtro, caché corta."""
+    """Resolve final rápido: URL exacta, texto con candidatos filtrados y caché."""
     original_query = str(busqueda or "").strip()
-    query = _clean_search_query(original_query)
+    query = _remove_trailing_music_punctuation(_clean_search_query(original_query))
     if not query:
         raise MusicSearchError("Escribe el nombre o enlace de una canción.")
 
@@ -9292,10 +9387,10 @@ async def resolve_song(
         if max_duration and duration and duration > max_duration:
             raise MusicSearchError("La canción supera la duración máxima permitida.")
 
-        if not direct_requested and _is_unwanted_music_version(info, query):
-            raise MusicSearchError("El resultado era karaoke/instrumental/remix y no fue pedido.")
-        if not direct_requested and _is_too_weak_music_match(info, query):
-            raise MusicSearchError("El resultado coincidía muy poco con la búsqueda.")
+        if not direct_requested:
+            reason = _candidate_reject_reason(info, query)
+            if reason:
+                raise MusicSearchError(reason)
 
         song = {
             "title": str(info.get("title") or query)[:100],
@@ -9311,7 +9406,7 @@ async def resolve_song(
         logger.info("⚡ Canción resuelta rápido: %s", song["title"])
         return song
     except Exception as e:
-        logger.warning("Resolve rápido falló para '%s': %s", query[:120], str(e)[:220])
+        logger.warning("Resolve rápido falló para '%s': %s", query[:120], str(e)[:240])
         if direct_requested:
             msg = "No pude abrir ese enlace exacto de YouTube en Render. Prueba otro enlace del mismo tema o el nombre con artista."
         else:
