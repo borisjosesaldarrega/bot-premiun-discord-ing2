@@ -8429,6 +8429,212 @@ async def resolve_dj_song(
     raise MusicSearchError(f"No encontré una canción nueva para `{query}` sin repetir ni meter basura. Detalle: {detail}")
 
 
+
+# ===============================================================
+# FIX FINAL FINAL: canal DJ definido + fallback para URLs bloqueadas
+# ===============================================================
+# Este bloque queda al final para sobrescribir comportamiento anterior sin tocar
+# tickets, bienvenida, moderación ni start.sh.
+
+
+def _dj_channel_from_session(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    """Devuelve el canal donde el DJ debe avisar, sin romper Pylance ni runtime."""
+    if not guild:
+        return None
+
+    session = dj_sessions.get(guild.id, {}) if isinstance(dj_sessions, dict) else {}
+    origin = session.get("origin_channel")
+
+    candidates = []
+    if isinstance(origin, discord.TextChannel):
+        candidates.append(origin)
+    elif isinstance(origin, int):
+        candidates.append(guild.get_channel(origin) or bot.get_channel(origin))
+
+    candidates.extend([
+        bot.get_channel(last_text_channel_ids.get(guild.id)) if last_text_channel_ids.get(guild.id) else None,
+        guild.system_channel,
+    ])
+
+    me = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+    for channel in candidates:
+        if isinstance(channel, discord.TextChannel):
+            try:
+                if me is None or channel.permissions_for(me).send_messages:
+                    return channel
+            except Exception:
+                continue
+
+    for channel in getattr(guild, "text_channels", []):
+        try:
+            if me is None or channel.permissions_for(me).send_messages:
+                return channel
+        except Exception:
+            continue
+    return None
+
+
+async def _fetch_youtube_title_from_oembed(url: str) -> Optional[str]:
+    """Saca título de YouTube sin yt-dlp para rescatar URLs bloqueadas en Render."""
+    clean_url = _normalize_youtube_url_for_play(url) if '_normalize_youtube_url_for_play' in globals() else str(url or '').strip()
+    if not clean_url:
+        return None
+
+    endpoints = [
+        "https://www.youtube.com/oembed?format=json&url=" + urllib.parse.quote(clean_url, safe=""),
+        "https://noembed.com/embed?url=" + urllib.parse.quote(clean_url, safe=""),
+    ]
+
+    timeout = aiohttp.ClientTimeout(total=6)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134 Safari/537.36"
+    }
+
+    for endpoint in endpoints:
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(endpoint) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json(content_type=None)
+                    title = str(data.get("title") or "").strip()
+                    if title:
+                        return title
+        except Exception as exc:
+            logger.debug("No pude leer oEmbed de YouTube: %s", str(exc)[:160])
+    return None
+
+
+def _title_to_music_search(title: str) -> str:
+    """Convierte títulos de embeds/YouTube en búsqueda musical limpia."""
+    title = str(title or "").strip()
+    if not title:
+        return ""
+
+    # Quita adornos de canales y videos tipo Regular Show/MV fan-made.
+    title = re.sub(r"[\\/]{2,}.*$", " ", title)
+    title = re.sub(r"[•●·].*$", " ", title)
+    title = re.sub(r"\b(regular show|cuenta[_\s-]*random|sub español|subtitulado|lyrics?|letra|hd|4k)\b", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\[[^\]]*\]|\([^)]*(?:karaoke|instrumental|cover|remix|slowed|reverb|live|en vivo)[^)]*\)", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+", " ", title).strip(" -|–—")
+    return _clean_search_query(title)
+
+
+async def _extract_music_from_title_fallback(url: str):
+    """Cuando el video directo está bloqueado, busca por título fuera del enlace."""
+    title = await _fetch_youtube_title_from_oembed(url)
+    search_title = _title_to_music_search(title or "")
+    if not search_title:
+        raise MusicSearchError("No pude obtener título alternativo del enlace de YouTube.")
+
+    logger.info("URL directa bloqueada; intento por título alternativo: %s", search_title[:120])
+
+    q_lower = search_title.lower()
+    wants_alt = any(word in q_lower for word in _ALT_VERSION_WORDS) if '_ALT_VERSION_WORDS' in globals() else False
+    negative = "" if wants_alt else " -remix -cover -slowed -reverb -karaoke -live -instrumental -nightcore -sped -tiktok -remake"
+
+    attempts = [
+        f"ytsearch8:{search_title} official audio{negative}",
+        f"ytsearch8:{search_title} audio oficial{negative}",
+        f"ytsearch8:{search_title} official video{negative}",
+        f"ytsearch8:{search_title}{negative}",
+        f"scsearch8:{search_title}",
+    ]
+
+    last_error = None
+    for attempt in attempts:
+        try:
+            info, audio_url = await extract_music_with_python_api_bot18(attempt)
+            if _is_unwanted_music_version(info, search_title):
+                last_error = MusicSearchError("Resultado alternativo era karaoke/remix/instrumental.")
+                continue
+            if _is_too_weak_music_match(info, search_title):
+                last_error = MusicSearchError("Resultado alternativo coincidía muy poco.")
+                continue
+            logger.info("URL resuelta por título alternativo: %s", str(info.get('title') or search_title)[:100])
+            return info, audio_url
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Fallback por título falló para '%s': %s", attempt[:100], str(exc)[:160])
+
+    raise MusicSearchError(str(last_error or "No hubo audio por título alternativo."))
+
+
+_extract_music_legacy_before_url_title_fallback = extract_music_legacy_like_bot18
+
+
+async def extract_music_legacy_like_bot18(query: str):
+    """Extractor final: primero lo normal; si URL YouTube falla, rescata por título."""
+    clean_query = _clean_search_query(query)
+    try:
+        return await _extract_music_legacy_before_url_title_fallback(clean_query or query)
+    except Exception as first_error:
+        if _query_is_direct_url(clean_query) and ("youtube.com" in clean_query.lower() or "youtu.be" in clean_query.lower()):
+            try:
+                return await _extract_music_from_title_fallback(clean_query)
+            except Exception as fallback_error:
+                logger.warning(
+                    "URL YouTube falló directo y por título. Directo=%s | título=%s",
+                    str(first_error)[:180],
+                    str(fallback_error)[:180],
+                )
+                raise fallback_error from first_error
+        raise
+
+
+_resolve_song_before_final_url_title_fallback = resolve_song
+
+
+async def resolve_song(
+    busqueda: str,
+    requested_by,
+    *,
+    max_duration: Optional[int] = None,
+    exclude_markers: Optional[Set[str]] = None,
+) -> Dict:
+    """Resolve final: conserva filtros y mejora URLs de YouTube bloqueadas."""
+    query = _clean_search_query(busqueda)
+    if not query:
+        raise MusicSearchError("Escribe el nombre o enlace de una canción.")
+
+    direct = _query_is_direct_url(query)
+    exclude_markers = set(exclude_markers or set())
+
+    try:
+        info, audio_url = await extract_music_legacy_like_bot18(query)
+        duration = _safe_int(info.get("duration"), 0)
+        if max_duration and duration and duration > max_duration:
+            raise MusicSearchError("La canción supera la duración máxima permitida.")
+
+        # Si era URL directa pero se resolvió por título alternativo, igual filtramos karaoke/instrumental.
+        title_for_filter = str(info.get("title") or query)
+        if _is_unwanted_music_version(info, title_for_filter if direct else query):
+            raise MusicSearchError("El resultado era karaoke/instrumental/remix y no fue pedido.")
+        if not direct and _is_too_weak_music_match(info, query):
+            raise MusicSearchError("El resultado coincidía muy poco con la búsqueda.")
+
+        song = {
+            "title": str(info.get("title") or query)[:100],
+            "url": audio_url,
+            "web_url": info.get("webpage_url") or info.get("original_url") or query,
+            "duration": duration,
+            "requested_by": requested_by,
+            "thumbnail": info.get("thumbnail") or "https://i.imgur.com/8Km9tLL.png",
+            "uploader": str(info.get("uploader") or info.get("channel") or "Artista desconocido")[:80],
+        }
+        if exclude_markers and (song_markers(song) & exclude_markers):
+            raise MusicSearchError("La canción ya está sonando, en cola o fue usada recientemente.")
+        logger.info("Canción resuelta con fallback final: %s", song["title"])
+        return song
+    except Exception as e:
+        logger.warning("Extractor finalísimo falló para '%s': %s", query, str(e)[:220])
+        raise MusicSearchError(
+            f"No pude obtener audio reproducible para `{query}`. "
+            "YouTube en Render está bloqueando esa fuente. Probé enlace limpio y búsqueda por título; "
+            "intenta escribir artista + canción exacta o actualiza cookies.txt."
+        ) from e
+
+
 if not TOKEN:
     raise RuntimeError("Falta DISCORD_TOKEN/discord_token. En Render crea la variable discord_token; localmente puedes usar .env con DISCORD_TOKEN.")
 
@@ -8442,4 +8648,3 @@ except Exception as e:
     logger.warning(f"No se pudo iniciar webserver keepalive: {e}")
 
 bot.run(TOKEN)
-
