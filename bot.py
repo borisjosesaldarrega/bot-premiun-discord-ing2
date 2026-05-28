@@ -6,6 +6,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import sys
+import shutil
 import importlib.metadata as importlib_metadata
 import random
 import subprocess
@@ -419,46 +420,234 @@ LEGACY_FFMPEG_OPTIONS = {
 }
 
 
-async def extract_music_legacy_like_bot18(query: str):
-    """Extrae música exactamente al estilo del bot 18: ytsearch -> primera entrada -> url/formato con audio."""
+def _pick_audio_url_from_info(info: Dict) -> Optional[str]:
+    """Saca una URL de audio usando la lógica simple del bot 18, pero sin reventar."""
+    if not isinstance(info, dict):
+        return None
+
+    audio_url = info.get("url")
+    if audio_url:
+        return audio_url
+
+    formats = info.get("formats") or []
+
+    # Primero audio puro.
+    for fmt in formats:
+        if (
+            isinstance(fmt, dict)
+            and fmt.get("url")
+            and fmt.get("acodec") not in (None, "none")
+            and fmt.get("vcodec") in (None, "none")
+        ):
+            return fmt.get("url")
+
+    # Luego cualquier formato que tenga audio.
+    for fmt in formats:
+        if isinstance(fmt, dict) and fmt.get("url") and fmt.get("acodec") not in (None, "none"):
+            return fmt.get("url")
+
+    # Último recurso: cualquier URL de formato.
+    for fmt in formats:
+        if isinstance(fmt, dict) and fmt.get("url"):
+            return fmt.get("url")
+
+    return None
+
+
+def _normalize_yt_dlp_dump(info) -> List[Dict]:
+    """Normaliza salida de yt-dlp/CLI a una lista de entradas dict."""
+    if not info:
+        return []
+    if isinstance(info, dict) and "entries" in info:
+        return [e for e in (info.get("entries") or []) if isinstance(e, dict)]
+    return [info] if isinstance(info, dict) else []
+
+
+def get_deno_runtime_path() -> Optional[str]:
+    """Busca Deno instalado por render_build.sh o en PATH."""
+    candidates = [
+        os.getenv("DENO_PATH"),
+        os.path.join(os.getcwd(), ".deno", "bin", "deno"),
+        "/opt/render/project/src/.deno/bin/deno",
+        "/opt/render/project/.deno/bin/deno",
+        shutil.which("deno"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+async def run_yt_dlp_cli_json(query: str, *, use_cookies: bool = False, search_count: int = 3):
+    """Ejecuta yt-dlp por CLI con Deno/EJS.
+
+    En Render, el error "Requested format is not available" suele venir de YouTube
+    pidiendo resolver desafíos JavaScript. La API Python no siempre deja claro qué
+    runtime está usando, así que este fallback llama a `python -m yt_dlp` con
+    `--js-runtimes deno:...` y `--remote-components ejs:github`.
+    """
+    is_url = bool(URL_REGEX.match(query))
+    search_value = query if is_url else f"ytsearch{max(1, min(search_count, 5))}:{query}"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "--dump-single-json",
+        "--no-playlist",
+        "--no-warnings",
+        "--quiet",
+        "--ignore-errors",
+        "--no-cache-dir",
+        "--force-ipv4",
+        "-f",
+        "bestaudio/best",
+        "--default-search",
+        "ytsearch",
+    ]
+
+    deno_path = get_deno_runtime_path()
+    if deno_path:
+        cmd.extend(["--js-runtimes", f"deno:{deno_path}"])
+        # GitHub evita depender de npm; funciona mejor en hosting cerrados.
+        cmd.extend(["--remote-components", "ejs:github"])
+    else:
+        logger.warning("No encontré Deno. YouTube puede devolver solo imágenes/SABR en Render.")
+
+    cookiefile = get_cookiefile_path()
+    if use_cookies and cookiefile:
+        cmd.extend(["--cookies", cookiefile])
+
+    cmd.append(search_value)
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=45)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        raise MusicSearchError("yt-dlp tardó demasiado resolviendo YouTube.")
+
+    out = stdout.decode("utf-8", errors="replace").strip()
+    err = stderr.decode("utf-8", errors="replace").strip()
+
+    if process.returncode != 0 and not out:
+        raise MusicSearchError((err or f"yt-dlp CLI salió con código {process.returncode}")[:700])
+
+    if not out:
+        raise MusicSearchError((err or "yt-dlp CLI no devolvió JSON")[:700])
+
+    # Por seguridad, si alguna advertencia se coló, buscamos el primer JSON.
+    json_start = out.find("{")
+    if json_start > 0:
+        out = out[json_start:]
+
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise MusicSearchError(f"yt-dlp CLI devolvió JSON inválido: {out[:250]}") from exc
+
+
+async def extract_music_with_cli_ejs(query: str):
+    """Extractor principal para Render: CLI + Deno/EJS + cookies como respaldo."""
+    last_error = None
+
+    # Primero sin cookies. Con YouTube actual, cookies válidas a veces provocan formatos vacíos.
+    for use_cookies in (False, True):
+        try:
+            info = await run_yt_dlp_cli_json(query, use_cookies=use_cookies, search_count=3)
+            entries = _normalize_yt_dlp_dump(info)
+            if not entries:
+                raise MusicSearchError("yt-dlp CLI no devolvió entradas.")
+
+            for entry in entries:
+                audio_url = _pick_audio_url_from_info(entry)
+                if audio_url:
+                    logger.info(
+                        "Canción resuelta con CLI EJS (%s): %s",
+                        "cookies" if use_cookies else "sin cookies",
+                        str(entry.get("title") or query)[:100]
+                    )
+                    return entry, audio_url
+
+            raise MusicSearchError("yt-dlp CLI encontró resultados, pero ninguno traía audio reproducible.")
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Extractor CLI EJS falló para '%s' (%s): %s",
+                query,
+                "cookies" if use_cookies else "sin cookies",
+                str(exc)[:220]
+            )
+
+    raise MusicSearchError(str(last_error or "yt-dlp CLI no pudo resolver la canción"))
+
+
+async def extract_music_with_python_api_bot18(query: str):
+    """Extractor viejo del bot 18 usando la API Python de yt-dlp."""
     is_url = bool(URL_REGEX.match(query))
     search_value = query if is_url else f"ytsearch:{query}"
 
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-        info = await extract_info_async(ydl, search_value, download=False)
+    # Igual que el bot 18, pero probando sin cookies y luego con cookies.
+    for use_cookies in (False, True):
+        opts = dict(ydl_opts)
+        opts.pop("cookiefile", None)
+        if use_cookies:
+            cookiefile = get_cookiefile_path()
+            if cookiefile:
+                opts["cookiefile"] = cookiefile
+            else:
+                continue
 
-    if not info:
-        raise MusicSearchError("yt-dlp no devolvió información. En Render suele ser bloqueo de YouTube/cookies.")
+        try:
+            with youtube_dl.YoutubeDL(opts) as ydl:
+                info = await extract_info_async(ydl, search_value, download=False)
 
-    if isinstance(info, dict) and 'entries' in info:
-        entries = [e for e in (info.get('entries') or []) if isinstance(e, dict)]
-        if not entries:
-            raise MusicSearchError("yt-dlp no devolvió resultados válidos desde YouTube.")
-        info = entries[0]
+            entries = _normalize_yt_dlp_dump(info)
+            if not entries:
+                raise MusicSearchError("yt-dlp no devolvió resultados válidos desde YouTube.")
 
-    if not isinstance(info, dict):
-        raise MusicSearchError("yt-dlp devolvió una respuesta inválida.")
+            info = entries[0]
+            audio_url = _pick_audio_url_from_info(info)
+            if not audio_url:
+                raise MusicSearchError("YouTube encontró el video, pero no entregó URL de audio reproducible.")
 
-    audio_url = info.get('url')
-    if not audio_url:
-        formats = info.get('formats') or []
-        audio_url = next(
-            (
-                f.get('url') for f in formats
-                if isinstance(f, dict) and f.get('url') and f.get('acodec') != 'none'
-            ),
-            None
-        )
-        if not audio_url and formats:
-            audio_url = next(
-                (f.get('url') for f in formats if isinstance(f, dict) and f.get('url')),
-                None
+            logger.info(
+                "Canción resuelta con API estilo bot 18 (%s): %s",
+                "cookies" if use_cookies else "sin cookies",
+                str(info.get("title") or query)[:100]
+            )
+            return info, audio_url
+        except Exception as exc:
+            logger.warning(
+                "Extractor API bot18 falló para '%s' (%s): %s",
+                query,
+                "cookies" if use_cookies else "sin cookies",
+                str(exc)[:220]
             )
 
-    if not audio_url:
-        raise MusicSearchError("YouTube encontró el video, pero no entregó URL de audio reproducible.")
+    raise MusicSearchError("yt-dlp no devolvió audio reproducible desde YouTube.")
 
-    return info, audio_url
+
+async def extract_music_legacy_like_bot18(query: str):
+    """Extrae música priorizando que funcione en Render.
+
+    Orden:
+    1. CLI con Deno/EJS, que es el fix real para el error de formatos/SABR.
+    2. API Python estilo bot 18, como respaldo.
+    """
+    try:
+        return await extract_music_with_cli_ejs(query)
+    except Exception as cli_error:
+        logger.warning("CLI EJS no pudo resolver '%s'; pruebo API bot18: %s", query, str(cli_error)[:220])
+
+    return await extract_music_with_python_api_bot18(query)
+
 
 # --------------------------
 # Funciones auxiliares
