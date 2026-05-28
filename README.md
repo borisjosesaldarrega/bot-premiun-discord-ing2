@@ -1,104 +1,91 @@
-# Archeon Bot - paquete corregido para hosting
+# Archeon Bot — paquete para Render + UptimeRobot
 
-Este paquete contiene los archivos auxiliares corregidos para ejecutar el bot en Windows o en un VPS Linux.
+Este ZIP está preparado según el flujo del video que describiste, pero aplicado a tu bot Archeon.
 
-## Archivos principales
+## Qué se cambió sin tocar la lógica del bot
 
-- `requirements.txt`: dependencias del bot en UTF-8.
-- `.env.example`: plantilla segura de variables.
-- `start_windows.ps1`: inicio recomendado en Windows.
-- `start_windows.bat`: inicio alternativo en Windows.
-- `instalar_dependencias_windows.ps1`: instala dependencias y muestra versiones.
-- `start.sh`: inicio recomendado en Linux/VPS.
-- `.gitignore`: evita subir `.env`, `.venv`, logs, cookies y archivos privados.
-- `cookies.txt.example`: plantilla opcional para yt-dlp.
+- Se agregó `webserver.py` con Flask para tener una URL activa.
+- `bot.py` ahora acepta el token desde `discord_token` **o** `DISCORD_TOKEN`.
+- Antes de `bot.run(TOKEN)` se llama `keepalive()` para levantar el servidor web.
+- Se agregó `Flask` a `requirements.txt`.
+- Se quitaron del ZIP: `.env`, `.venv`, `bot.log`, `cookies.txt` real y cachés.
 
-## Requisitos externos
+## Estructura importante
 
-FFmpeg no se instala con pip. Debe instalarse en el sistema.
-
-### Windows
-
-```powershell
-winget install Gyan.FFmpeg
+```txt
+bot.py
+webserver.py
+requirements.txt
+.env.example
+Procfile
+render.yaml
+runtime.txt
+start.sh
 ```
 
-Cierra y abre PowerShell/VS Code, luego prueba:
-
-```powershell
-ffmpeg -version
-```
-
-### Ubuntu/Debian VPS
-
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip ffmpeg unzip git
-```
-
-## Instalación rápida en Windows
+## Probar local en PowerShell
 
 ```powershell
 cd "C:\Users\salda\Downloads\ARCHEON DISCORD"
-copy .env.example .env
-notepad .env
-.\instalar_dependencias_windows.ps1
-.\start_windows.ps1
+python -m pip install -r requirements.txt
+$env:discord_token="TU_TOKEN_NUEVO"
+python bot.py
 ```
 
-## Instalación rápida en Linux/VPS
+Abre en navegador:
 
-```bash
-chmod +x start.sh
-cp .env.example .env
-nano .env
-./start.sh
+```txt
+http://localhost:8080
+http://localhost:8080/health
 ```
 
-## Mantenerlo 24/7 en Linux con systemd
+## Subir a GitHub
 
-Crea el servicio:
+1. Crea repo privado.
+2. Sube estos archivos, pero NO subas `.env`.
+3. Confirma que `.venv/` no está en el repo.
 
-```bash
-sudo nano /etc/systemd/system/archeon.service
+## Render
+
+Crear `New Web Service` desde GitHub.
+
+Configura:
+
+```txt
+Build Command: pip install -r requirements.txt
+Start Command: python bot.py
 ```
 
-Ejemplo:
+Environment Variables:
 
-```ini
-[Unit]
-Description=Archeon Discord Bot
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/home/ubuntu/archeon
-ExecStart=/home/ubuntu/archeon/.venv/bin/python /home/ubuntu/archeon/bot.py
-Restart=always
-RestartSec=10
-Environment=PYTHONUNBUFFERED=1
-
-[Install]
-WantedBy=multi-user.target
+```env
+discord_token=TU_TOKEN_NUEVO
+GOOGLE_API_KEY=
+STABILITY_API_KEY=
+AUTO_VOICE_DISCONNECT=true
+MODERATION_AI_ENABLED=false
+DJ_USE_GEMINI=false
 ```
 
-Activa:
+Si usas tickets/bienvenida, agrega también:
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable archeon
-sudo systemctl start archeon
-journalctl -u archeon -f
+```env
+TICKET_REQUEST_CHANNEL_ID=1387966992811556944
+TICKET_LOG_CHANNEL_ID=1387966992811556944
+TICKET_STAFF_ROLE_IDS=1509364337259581440
+WELCOME_CHANNEL_ID=902057453204697092
+```
+
+## UptimeRobot
+
+Cuando Render te dé una URL, crea un monitor HTTP cada 5 minutos apuntando a:
+
+```txt
+https://TU-SERVICIO.onrender.com/health
 ```
 
 ## Importante
 
-Nunca subas ni compartas:
+Render puede pedir tarjeta según región/cuenta. Si te pide tarjeta y no quieres, usa un hosting de bots con Docker/Python o busca cupo en otro servicio gratuito.
 
-- `.env`
-- `cookies.txt`
-- `.venv/`
-- `bot.log`
-- tokens/API keys
-
-Si alguna llave se compartió por error, regénérala antes de alojar el bot.
+Regenera tu token de Discord antes de alojarlo si alguna vez lo pegaste o compartiste.

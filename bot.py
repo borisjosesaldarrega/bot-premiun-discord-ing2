@@ -295,7 +295,9 @@ FFMPEG_OPTIONS = {
 # Importante: YouTube a veces devuelve "Sign in to confirm you're not a bot".
 # Por eso buscamos varios resultados, saltamos entradas rotas y usamos SoundCloud como respaldo.
 ydl_opts = {
-    'format': 'bestaudio/best',
+    # Formato más tolerante para servidores cloud como Render.
+    # YouTube a veces no entrega bestaudio limpio, pero sí algún stream con audio.
+    'format': 'bestaudio[acodec!=none]/best[acodec!=none]/best',
     'default_search': 'ytsearch',
     'noplaylist': True,
     'quiet': True,
@@ -314,18 +316,28 @@ ydl_opts = {
     'skip_unavailable_fragments': True,
     'cachedir': False,
     'prefer_ffmpeg': True,
-    # Algunos clientes de YouTube fallan menos que el cliente web normal.
+    # En Render/hosting cloud los clientes móviles pueden devolver formatos raros.
+    # default/tv/web suele ser más estable con cookies exportadas.
     'extractor_args': {
         'youtube': {
-            'player_client': ['android', 'ios', 'web']
+            'player_client': ['default', 'tv', 'web']
         }
     }
 }
 
 # Usa cookies solo si existe el archivo. Así el bot no muere por un cookies.txt faltante.
-# Si YouTube te bloquea mucho, exporta cookies a cookies.txt y déjalo en la carpeta del bot.
-if os.path.exists('cookies.txt'):
-    ydl_opts['cookiefile'] = 'cookies.txt'
+# En Render, los Secret Files suelen montarse como /etc/secrets/cookies.txt.
+# En local, el archivo normalmente está junto a bot.py como cookies.txt.
+cookie_paths = [
+    "cookies.txt",
+    "/etc/secrets/cookies.txt",
+]
+
+for cookie_path in cookie_paths:
+    if os.path.exists(cookie_path):
+        ydl_opts["cookiefile"] = cookie_path
+        logger.info(f"Usando cookies de YouTube desde: {cookie_path}")
+        break
 
 # --------------------------
 # Funciones auxiliares
@@ -1005,31 +1017,101 @@ def _is_youtube_bot_check_error(error: BaseException) -> bool:
     )
 
 
-def _score_music_candidate(info: Dict, query: str) -> int:
-    """Puntúa resultados para evitar escoger el primer video roto o irrelevante."""
+def _query_wants_version(query: str, word: str) -> bool:
+    """Devuelve True si el usuario pidió explícitamente una versión tipo remix/live/etc."""
+    return word.lower() in str(query or "").lower()
+
+
+def _is_unwanted_music_version(info: Dict, query: str) -> bool:
+    """
+    Evita reproducir remixes/covers/live/slowed si el usuario no los pidió.
+    Mejor fallar con mensaje claro que poner una canción equivocada.
+    """
     title = str(info.get("title") or "").lower()
     uploader = str(info.get("uploader") or info.get("channel") or "").lower()
     haystack = f"{title} {uploader}"
-    tokens = [t for t in re.findall(r"[a-zA-ZáéíóúüñÁÉÍÓÚÜÑ0-9]+", query.lower()) if len(t) > 1]
+    q = str(query or "").lower()
+
+    unwanted_words = [
+        "remix", "cover", "karaoke", "reaction", "tutorial",
+        "slowed", "reverb", "speed up", "sped up", "nightcore",
+        "instrumental", "live", "en vivo", "8d", "bass boosted",
+        "edit", "tiktok", "tik tok", "mashup", "version salsa",
+        "versión salsa", "acoustic", "acústico"
+    ]
+
+    for word in unwanted_words:
+        if word in haystack and word not in q:
+            return True
+    return False
+
+
+def _score_music_candidate(info: Dict, query: str) -> int:
+    """Puntúa resultados para elegir mejor la canción exacta y evitar remixes falsos."""
+    title_raw = str(info.get("title") or "")
+    uploader_raw = str(info.get("uploader") or info.get("channel") or "")
+    title = title_raw.lower()
+    uploader = uploader_raw.lower()
+    q = str(query or "").lower()
+    haystack = f"{title} {uploader}"
+
+    tokens = [
+        t for t in re.findall(r"[a-zA-ZáéíóúüñÁÉÍÓÚÜÑ0-9]+", q)
+        if len(t) > 1
+    ]
 
     score = 0
+    matched = 0
+
     for token in tokens:
         if token in title:
+            score += 12
+            matched += 1
+        elif token in uploader:
             score += 8
+            matched += 1
         elif token in haystack:
             score += 3
 
-    duration = _safe_int(info.get("duration"), 0)
-    if 70 <= duration <= 420:
-        score += 6
-    elif duration and duration > 900:
-        score -= 15
+    # Si coincide casi todo lo que pidió el usuario, probablemente es la canción correcta.
+    if tokens and matched >= max(1, len(tokens) - 1):
+        score += 35
 
-    lowered_title = title
-    if any(bad in lowered_title for bad in ("karaoke", "cover", "reaction", "tutorial", "letra traducida")):
-        score -= 4
-    if any(good in lowered_title for good in ("official", "audio", "lyrics", "video oficial", "letra")):
-        score += 2
+    clean_q = re.sub(r"\s+", " ", q).strip()
+    clean_title = re.sub(r"\s+", " ", title).strip()
+    if clean_q and clean_q in clean_title:
+        score += 45
+
+    duration = _safe_int(info.get("duration"), 0)
+    if 90 <= duration <= 420:
+        score += 10
+    elif duration and duration > 600:
+        score -= 25
+
+    # Penalizar versiones no pedidas. Si el usuario pidió "remix", entonces remix sí compite.
+    bad_words = [
+        "remix", "cover", "karaoke", "reaction", "tutorial",
+        "slowed", "reverb", "speed up", "sped up", "nightcore",
+        "instrumental", "live", "en vivo", "8d", "bass boosted",
+        "edit", "tiktok", "tik tok", "mashup", "version salsa",
+        "versión salsa", "acoustic", "acústico"
+    ]
+    for bad in bad_words:
+        if bad in title and bad not in q:
+            score -= 80
+
+    good_words = [
+        "official audio", "audio oficial", "video oficial",
+        "official video", "letra", "lyrics"
+    ]
+    for good in good_words:
+        if good in title:
+            score += 10
+
+    # Si el canal/uploader contiene artista buscado, es señal fuerte.
+    for token in tokens:
+        if token in uploader:
+            score += 10
 
     return score
 
@@ -1136,7 +1218,7 @@ async def create_audio_source(url: str, guild_id: Optional[int] = None):
         ) from e
 
 def build_music_searches(busqueda: str) -> List[str]:
-    """Arma búsquedas escalonadas: YouTube normal, YouTube afinado y respaldo en SoundCloud."""
+    """Arma búsquedas más precisas para evitar remixes y resultados falsos."""
     query = _clean_search_query(busqueda)
     if not query:
         return []
@@ -1144,16 +1226,28 @@ def build_music_searches(busqueda: str) -> List[str]:
     if URL_REGEX.match(query):
         return [query]
 
+    q_lower = query.lower()
+    wants_alt_version = any(
+        word in q_lower
+        for word in ("remix", "cover", "live", "en vivo", "slowed", "karaoke", "instrumental")
+    )
+
+    negative = ""
+    if not wants_alt_version:
+        negative = " -remix -cover -slowed -reverb -karaoke -live -instrumental -nightcore"
+
     searches = [
-        f"ytsearch10:{query}",
-        f"ytsearch10:{query} canción",
-        f"ytsearch10:{query} official audio",
-        f"ytsearch10:{query} lyrics",
-        f"ytsearch10:{query} video oficial",
-        f"scsearch5:{query}",
+        f"ytsearch20:{query}{negative}",
+        f"ytsearch20:{query} official audio{negative}",
+        f"ytsearch20:{query} audio oficial{negative}",
+        f"ytsearch20:{query} official video{negative}",
+        f"ytsearch20:{query} video oficial{negative}",
+        f"ytsearch20:{query} lyrics{negative}",
+        f"ytsearch20:{query} letra{negative}",
+        # SoundCloud queda al final. También se filtra para evitar remixes no pedidos.
+        f"scsearch10:{query}",
     ]
 
-    # Quitar duplicados manteniendo orden.
     unique = []
     seen = set()
     for item in searches:
@@ -1216,6 +1310,12 @@ async def resolve_song(
 
             for entry in entries:
                 try:
+                    if _is_unwanted_music_version(entry, query):
+                        last_errors.append(
+                            f"{search_query}: versión no pedida saltada ({str(entry.get('title') or '')[:70]})"
+                        )
+                        continue
+
                     duration = _safe_int(entry.get("duration"), 0)
                     if max_duration and duration and duration > max_duration:
                         continue
