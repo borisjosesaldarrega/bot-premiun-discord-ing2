@@ -7521,134 +7521,150 @@ async def on_voice_state_update(member, before, after):
 
 
 
+
 # ===============================================================
-# FIX FINAL DJ RENDER: variedad + no congelar heartbeat + cola viva
+# FIX FINAL REAL: DJ no pierde palabras, no busca "sal" solo,
+# no bloquea voz y play no acepta karaoke/instrumental si no se pidió.
 # ===============================================================
-# Estas definiciones reemplazan las anteriores sin tocar tickets, bienvenida
-# ni comandos generales. Van al final a propósito: Python usará estas versiones.
+# Va antes de bot.run para reemplazar las versiones anteriores.
 
 DJ_AUTO_ADD_COOLDOWN = int(os.getenv("DJ_AUTO_ADD_COOLDOWN", "55"))
 DJ_AUTO_ADD_FAIL_COOLDOWN = int(os.getenv("DJ_AUTO_ADD_FAIL_COOLDOWN", "90"))
-DJ_YTDLP_API_TIMEOUT = int(os.getenv("DJ_YTDLP_API_TIMEOUT", "9"))
+DJ_YTDLP_API_TIMEOUT = int(os.getenv("DJ_YTDLP_API_TIMEOUT", "7"))
 DJ_INITIAL_TARGET = max(1, int(os.getenv("DJ_INITIAL_TARGET", "3")))
 DJ_AUTO_TARGET = max(1, int(os.getenv("DJ_AUTO_TARGET", "2")))
 
+_DJ_MODE_WORDS_RE = re.compile(
+    r"\b(official|oficial|audio|video|lyrics?|lyric|letra|visualizer|canciones?|populares|mejores|playlist|radio|mix|música|musica|similar(?:es)?|artistas?|temas?|rolas?)\b",
+    re.IGNORECASE,
+)
 
-def _dj_channel_from_session(guild: discord.Guild) -> Optional[discord.TextChannel]:
-    """Devuelve el canal de texto guardado por la sesión DJ, acepte ID u objeto."""
-    session = dj_sessions.get(guild.id, {})
-    origin = session.get("origin_channel")
 
-    if isinstance(origin, discord.TextChannel):
-        return origin
+def _dj_clean_match_query(query: str) -> str:
+    """Deja solo la parte musical útil para comparar candidatos DJ."""
+    q = _clean_search_query(query)
+    q = q.replace("a ", " ").replace("de ", " de ")
+    q = _DJ_MODE_WORDS_RE.sub(" ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q or _clean_search_query(query)
 
-    if isinstance(origin, int):
-        channel = guild.get_channel(origin) or bot.get_channel(origin)
-        if isinstance(channel, discord.TextChannel):
-            return channel
 
-    if hasattr(origin, "id"):
-        channel = guild.get_channel(origin.id) or bot.get_channel(origin.id)
-        if isinstance(channel, discord.TextChannel):
-            return channel
-
-    if guild.system_channel and guild.me and guild.system_channel.permissions_for(guild.me).send_messages:
-        return guild.system_channel
-
-    for channel in guild.text_channels:
-        if guild.me and channel.permissions_for(guild.me).send_messages:
-            return channel
-    return None
+def _looks_like_artist_seed(seed: str) -> bool:
+    seed_norm = _normalize_song_title(seed)
+    if not seed_norm:
+        return False
+    bad_exact = {
+        "sal", "rosa", "amor", "cancion", "canción", "audio", "video",
+        "official", "oficial", "mix", "radio", "playlist", "tema", "musica", "música"
+    }
+    if seed_norm in bad_exact:
+        return False
+    return len(seed_norm) >= 3
 
 
 def _guess_artist_seeds_from_query(query: str) -> List[str]:
-    """Saca semillas de artista sin enamorarse del título de la canción.
+    """Saca artistas sin mutilar la búsqueda.
 
-    Casos clave:
-    - 'sal rosa latin mafia' -> ['latin mafia']
-    - 'secreto de amor joan sebastian' -> ['joan sebastian']
-    - 'latin mafia - sal rosa' -> ['latin mafia']
-    - 'bbno$ - meant to be' -> ['bbno']
+    Arreglo clave:
+    - `sal rosa` ya NO se convierte en `sal`.
+    - `sal rosa latin mafia` detecta `latin mafia`.
+    - `enamorado tuyo cuarteto de nos` detecta `cuarteto de nos`.
+    - `bbno$ - meant to be` detecta `bbno$`.
     """
-    q = _strip_music_noise(query)
+    raw = str(query or "").strip()
+    q = _strip_music_noise(_clean_search_query(raw))
     if not q:
         return []
 
     seeds: List[str] = []
 
+    # Si venía con separador artista - canción, usamos el lado izquierdo como artista.
     for sep in (" - ", " – ", " — ", " | "):
-        if sep in q:
-            left = q.split(sep, 1)[0].strip()
-            if len(left) >= 2:
+        if sep in raw:
+            left = raw.split(sep, 1)[0].strip()
+            if _looks_like_artist_seed(left):
                 seeds.append(left)
             break
 
     tokens = [t for t in re.findall(r"[a-zA-ZáéíóúüñÁÉÍÓÚÜÑ0-9$]+", q) if len(t) > 1]
-    stop_tail = {
-        "to", "be", "de", "la", "el", "del", "the", "and", "ft", "feat",
+    lower_tokens = [t.lower() for t in tokens]
+
+    generic = {
         "amor", "audio", "oficial", "official", "video", "lyrics", "letra",
         "remix", "remake", "cover", "live", "vivo", "slowed", "reverb",
-        "karaoke", "instrumental", "visualizer"
+        "karaoke", "instrumental", "visualizer", "canciones", "populares",
+        "mejores", "playlist", "radio", "mix", "similar", "similares"
     }
 
-    # Prioridad: últimos 2 tokens como artista, pero no si son frases flojas tipo "to be".
-    if len(tokens) >= 3:
-        last_two_tokens = tokens[-2:]
-        if not any(t.lower() in stop_tail for t in last_two_tokens):
-            seeds.append(" ".join(last_two_tokens))
+    # Si es consulta larga tipo canción + artista, probamos la cola como artista.
+    if len(tokens) >= 5:
+        last_three = " ".join(tokens[-3:])
+        # Permitimos conectores como "de" dentro de nombres: cuarteto de nos.
+        meaningful = [t for t in lower_tokens[-3:] if t not in {"de", "del", "la", "el", "los", "las"}]
+        if meaningful and not any(t in generic for t in meaningful):
+            seeds.append(last_three)
 
-    # Si el primer token parece artista corto o con símbolo, úsalo como respaldo.
+    if len(tokens) >= 4:
+        last_two = " ".join(tokens[-2:])
+        if not any(t in generic or t in {"to", "be"} for t in lower_tokens[-2:]):
+            seeds.append(last_two)
+
+    # Si el primer token tiene símbolo o parece nombre de artista corto, puede ser artista.
     if tokens:
         first = tokens[0]
-        if len(first) >= 2 and first.lower() not in stop_tail:
+        if ("$" in first or len(tokens) >= 4) and _looks_like_artist_seed(first):
             seeds.append(first)
 
-    # Último recurso: consulta completa solo si parece artista, no canción larga.
+    # Si la consulta es corta, NO la partimos. `sal rosa` se queda completo.
     if 1 <= len(tokens) <= 3:
-        compact = " ".join(tokens)
-        if compact.lower() not in {s.lower() for s in seeds}:
-            seeds.append(compact)
+        seeds.append(" ".join(tokens))
 
     unique: List[str] = []
     seen = set()
     for seed in seeds:
         clean = _clean_search_query(seed).strip(" -|–—")
-        key = clean.lower()
-        if clean and key not in seen and len(clean) >= 2:
+        key = _normalize_song_title(clean)
+        if clean and key not in seen and _looks_like_artist_seed(clean):
             unique.append(clean)
             seen.add(key)
     return unique[:3]
 
 
 def build_dj_fallback_terms(query: str, *, limit: int = 9) -> List[str]:
-    """Términos DJ más estables en Render.
+    """Términos DJ seguros.
 
-    Evita búsquedas tipo 'sal rosa canciones populares' porque YouTube devuelve
-    remakes/lyric/repetidos y además dispara anti-bot. Primero busca por artista.
+    El bug era que `¡dj sal rosa` generaba búsquedas como `sal official audio`.
+    Eso ya no pasa: primero se busca la consulta completa y luego artistas.
     """
     q = _clean_search_query(query)
     if not q:
         return []
 
-    seeds = _guess_artist_seeds_from_query(q)
     candidates: List[str] = []
+    q_lower = q.lower()
 
+    # Primero la búsqueda completa. Esto permite que `sal rosa` encuentre Sal rosa.
+    candidates.extend([
+        f"{q} official audio",
+        q,
+    ])
+
+    seeds = _guess_artist_seeds_from_query(q)
     for seed in seeds:
+        if _normalize_song_title(seed) == _normalize_song_title(q):
+            continue
         candidates.extend([
             f"{seed} official audio",
             f"{seed} canciones populares",
             f"{seed} mejores canciones",
-            f"{seed} playlist oficial",
             f"{seed} radio",
             f"{seed} mix",
-            f"música similar a {seed}",
         ])
 
-    # Respaldo con la consulta original al final, no al inicio.
+    # Respaldos suaves con la consulta completa, nunca con una palabra mutilada.
     candidates.extend([
-        f"{q} official audio",
-        f"{q} canciones similares",
         f"{q} radio",
+        f"{q} canciones similares",
     ])
 
     unique: List[str] = []
@@ -7659,23 +7675,22 @@ def build_dj_fallback_terms(query: str, *, limit: int = 9) -> List[str]:
         if clean and key not in seen:
             unique.append(clean)
             seen.add(key)
+        if len(unique) >= max(1, limit):
+            break
+    logger.info("DJ términos para '%s': %s", q[:80], unique[:limit])
     return unique[:limit]
 
 
-async def extract_music_candidates_with_python_api(query: str, *, limit: int = 4) -> List[tuple]:
-    """Obtiene pocos candidatos para DJ sin bloquear la voz.
-
-    Antes pedía hasta 8-10 candidatos; en Render eso hizo que YouTube pidiera
-    'Sign in to confirm' varias veces y terminó bloqueando el heartbeat de voz.
-    Aquí pedimos menos, usamos logger silencioso y timeout corto específico de DJ.
-    """
+async def extract_music_candidates_with_python_api(query: str, *, limit: int = 3) -> List[tuple]:
+    """Candidatos rápidos para DJ sin saturar YouTube ni bloquear heartbeat."""
     clean_query = _clean_search_query(query)
     if not clean_query:
         return []
 
     is_url = bool(URL_REGEX.match(clean_query))
-    safe_limit = max(1, min(int(limit or 3), 4))
-    search_value = clean_query if is_url else f"ytsearch{safe_limit}:{clean_query}"
+    is_prefixed_search = bool(re.match(r"^(ytsearch|scsearch)\d*:", clean_query, re.IGNORECASE))
+    safe_limit = max(1, min(int(limit or 2), 3))
+    search_value = clean_query if (is_url or is_prefixed_search) else f"ytsearch{safe_limit}:{clean_query}"
 
     cookiefile = get_cookiefile_path()
     attempts = [True] if cookiefile else [False]
@@ -7695,7 +7710,6 @@ async def extract_music_candidates_with_python_api(query: str, *, limit: int = 4
             "cachedir": False,
             "logger": QuietYDLLogger(),
         })
-
         if use_cookies and cookiefile:
             opts["cookiefile"] = cookiefile
 
@@ -7716,7 +7730,6 @@ async def extract_music_candidates_with_python_api(query: str, *, limit: int = 4
             if candidates:
                 logger.info("DJ recibió %s candidatos rápidos para: %s", len(candidates), clean_query[:80])
                 return candidates
-
             last_error = MusicSearchError("yt-dlp no devolvió candidatos con audio.")
         except Exception as exc:
             last_error = exc
@@ -7735,16 +7748,12 @@ async def resolve_dj_song(
     exclude_markers: Optional[Set[str]] = None,
     forbidden_phrases: Optional[Union[List[str], Set[str]]] = None,
 ) -> Dict:
-    """Resuelve una canción DJ con variedad, pero sin matar Render.
-
-    1) Prueba pocos candidatos.
-    2) Si YouTube se pone payaso, cae al resolver simple del bot 18.
-    3) Siempre filtra repetidas, remake, lyric, cover y variantes disfrazadas.
-    """
+    """Resuelve DJ sin repetir, sin karaoke/remake y sin elegir basura débil."""
     query = _clean_search_query(busqueda)
     if not query:
         raise MusicSearchError("Escribe el nombre o enlace de una canción.")
 
+    match_query = _dj_clean_match_query(query)
     exclude_markers = set(exclude_markers or set())
     forbidden_set = set(forbidden_phrases or [])
     rejected_reasons: List[str] = []
@@ -7775,11 +7784,14 @@ async def resolve_dj_song(
         if _is_unwanted_music_version(info, query):
             rejected_reasons.append(f"versión no pedida: {candidate['title']}")
             return None
+        if _is_too_weak_music_match(info, match_query):
+            rejected_reasons.append(f"coincidencia débil: {candidate['title']}")
+            return None
         return candidate
 
     try:
         candidates = await extract_music_candidates_with_python_api(query, limit=3)
-        ranked = sorted(candidates, key=lambda pair: _score_music_candidate(pair[0], query), reverse=True)
+        ranked = sorted(candidates, key=lambda pair: _score_music_candidate(pair[0], match_query), reverse=True)
         for info, audio_url in ranked:
             candidate = await _validate_candidate(info, audio_url)
             if candidate:
@@ -7788,9 +7800,9 @@ async def resolve_dj_song(
     except Exception as exc:
         rejected_reasons.append(f"candidatos fallaron: {str(exc)[:90]}")
 
-    # Fallback simple: es el método que ya demostró funcionar para canciones exactas.
+    # Fallback simple solo si no es una versión indeseada ni coincidencia floja.
     try:
-        song = await resolve_song(query, requested_by, max_duration=max_duration, exclude_markers=exclude_markers)
+        song = await _resolve_song_base_for_dj(query, requested_by, max_duration=max_duration, exclude_markers=exclude_markers)
         pseudo_info = {
             "title": song.get("title"),
             "uploader": song.get("uploader"),
@@ -7811,48 +7823,80 @@ async def resolve_dj_song(
     raise MusicSearchError(f"No encontré una canción nueva para `{query}` sin repetir. Detalle: {detail}")
 
 
-async def process_search_terms(interaction, search_terms: List[str]) -> int:
-    """Procesa términos DJ para slash usando el resolver con variedad."""
-    added_songs = 0
-    exclusions = get_dj_exclusion_markers(interaction.guild.id)
-    session = dj_sessions.setdefault(interaction.guild.id, {})
-    forbidden_phrases = session.setdefault("forbidden_phrases", [])
+# Guardamos el resolve_song viejo para usarlo con validación fina.
+try:
+    _resolve_song_base_for_dj = resolve_song
+except NameError:
+    _resolve_song_base_for_dj = None
 
-    for term in search_terms[:6]:
-        if added_songs >= DJ_INITIAL_TARGET:
-            break
-        try:
-            song = await resolve_dj_song(
-                term,
-                interaction.user,
-                max_duration=600,
-                exclude_markers=exclusions,
-                forbidden_phrases=forbidden_phrases,
-            )
-            added = await add_song_to_queue(interaction.guild.id, song, avoid_recent=True)
-            if added:
-                exclusions.update(song_markers(song))
-                core_phrase = _song_core_phrase(song)
-                if core_phrase:
-                    _remember_dj_forbidden_phrase(interaction.guild.id, core_phrase)
-                    forbidden_phrases = session.setdefault("forbidden_phrases", [])
-                added_songs += 1
-                await asyncio.sleep(0.25)
-        except Exception as e:
-            logger.warning("No se pudo procesar término DJ %s: %s", term, str(e)[:180])
-            await asyncio.sleep(0.15)
-            continue
 
-    return added_songs
+async def resolve_song(
+    busqueda: str,
+    requested_by,
+    *,
+    max_duration: Optional[int] = None,
+    exclude_markers: Optional[Set[str]] = None,
+) -> Dict:
+    """Play normal, pero no acepta karaoke/instrumental/remix si no lo pediste."""
+    query = _clean_search_query(busqueda)
+    if not query:
+        raise MusicSearchError("Escribe el nombre o enlace de una canción.")
+
+    # Primero intentamos pocos candidatos y elegimos uno sano.
+    try:
+        candidates = await extract_music_candidates_with_python_api(query, limit=3)
+        ranked = sorted(candidates, key=lambda pair: _score_music_candidate(pair[0], query), reverse=True)
+        for info, audio_url in ranked:
+            if _is_unwanted_music_version(info, query):
+                continue
+            if _is_too_weak_music_match(info, query):
+                continue
+            duration = _safe_int(info.get("duration"), 0)
+            if max_duration and duration and duration > max_duration:
+                continue
+            song = {
+                "title": str(info.get("title") or query)[:100],
+                "url": audio_url,
+                "web_url": info.get("webpage_url") or info.get("original_url") or query,
+                "duration": duration,
+                "requested_by": requested_by,
+                "thumbnail": info.get("thumbnail") or "https://i.imgur.com/8Km9tLL.png",
+                "uploader": str(info.get("uploader") or info.get("channel") or "Artista desconocido")[:80],
+            }
+            if exclude_markers and (song_markers(song) & set(exclude_markers)):
+                continue
+            logger.info("Canción resuelta con candidatos filtrados: %s", song["title"])
+            return song
+    except Exception as exc:
+        logger.debug("Resolve filtrado inicial falló para '%s': %s", query, str(exc)[:160])
+
+    # Si los candidatos fallan, usamos el método viejo, pero validando que no sea karaoke/remix falso.
+    if _resolve_song_base_for_dj is None:
+        raise MusicSearchError(f"No pude obtener audio reproducible para `{query}`.")
+
+    song = await _resolve_song_base_for_dj(query, requested_by, max_duration=max_duration, exclude_markers=exclude_markers)
+    pseudo_info = {
+        "title": song.get("title"),
+        "uploader": song.get("uploader"),
+        "channel": song.get("uploader"),
+        "duration": song.get("duration"),
+        "webpage_url": song.get("web_url"),
+    }
+    if _is_unwanted_music_version(pseudo_info, query):
+        raise MusicSearchError(
+            f"Encontré `{song.get('title')}`, pero es karaoke/instrumental/remix y no lo pediste. "
+            "Prueba con el enlace directo de la canción oficial."
+        )
+    if _is_too_weak_music_match(pseudo_info, query):
+        raise MusicSearchError(
+            f"Encontré `{song.get('title')}`, pero no coincide bien con `{query}`. "
+            "Prueba con artista + canción exacta o enlace directo."
+        )
+    return song
 
 
 async def auto_add_songs_task(guild):
-    """Auto-DJ estable para Render.
-
-    Evita buscar 5 términos pesados mientras hay música sonando. Eso era lo que
-    provocaba 'voice heartbeat blocked'. Ahora solo rellena cuando queda poca cola,
-    usa cooldown y si añade canciones con el reproductor parado arranca la cola.
-    """
+    """Auto-DJ estable: no congela voz, no busca una sola palabra y no insiste si YouTube bloquea."""
     while guild.id in dj_sessions and dj_sessions[guild.id].get("active"):
         try:
             session = dj_sessions.get(guild.id, {})
@@ -7865,12 +7909,9 @@ async def auto_add_songs_task(guild):
             queue_length = len(queues.get(guild.id, []))
             playing = bool(voice_client and (voice_client.is_playing() or voice_client.is_paused()))
 
-            # Si ya hay respaldo suficiente, no buscamos nada.
             if queue_length >= DJ_AUTO_TARGET:
                 await asyncio.sleep(10)
                 continue
-
-            # Si está sonando y aún hay una canción lista, esperamos para no bloquear heartbeats.
             if playing and queue_length >= 1:
                 await asyncio.sleep(12)
                 continue
@@ -7886,7 +7927,7 @@ async def auto_add_songs_task(guild):
                 await asyncio.sleep(20)
                 continue
 
-            search_terms = build_dj_fallback_terms(query, limit=6)
+            search_terms = build_dj_fallback_terms(query, limit=5)
             if not search_terms:
                 await asyncio.sleep(30)
                 continue
@@ -7915,13 +7956,13 @@ async def auto_add_songs_task(guild):
                         _remember_dj_forbidden_phrase(guild.id, core_phrase)
                         forbidden_phrases = session.setdefault("forbidden_phrases", [])
                     added_songs += 1
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(0.2)
                 except Exception as e:
                     logger.warning("No se pudo auto-añadir término DJ %s: %s", term, str(e)[:170])
-                    await asyncio.sleep(0.15)
+                    await asyncio.sleep(0.1)
                     continue
 
-            channel = _dj_channel_from_session(guild)
+            channel = _dj_channel_from_session(guild) if '_dj_channel_from_session' in globals() else None
             if added_songs > 0:
                 session["last_add_time"] = time.time()
                 session["next_auto_add_at"] = time.time() + DJ_AUTO_ADD_COOLDOWN
@@ -7932,7 +7973,6 @@ async def auto_add_songs_task(guild):
                     except Exception as e:
                         logger.debug("No pude avisar auto-add DJ: %s", e)
 
-                # Si la canción anterior ya terminó y agregamos cola, arranca reproducción.
                 voice_client = guild.voice_client
                 if voice_client and voice_client.is_connected() and not voice_client.is_playing() and not voice_client.is_paused():
                     class SimulatedContext:
@@ -7959,6 +7999,436 @@ async def auto_add_songs_task(guild):
         await asyncio.sleep(8)
 
 
+
+# ===============================================================
+# FIX FINAL EXTRA: URL de YouTube limpia + DJ estricto sin basura
+# ===============================================================
+# Colocado al final para sobrescribir definiciones anteriores antes de bot.run().
+
+_ALT_VERSION_WORDS = (
+    "remix", "cover", "karaoke", "reaction", "tutorial", "slowed", "reverb",
+    "speed up", "sped up", "nightcore", "instrumental", "live", "en vivo",
+    "8d", "bass boosted", "edit", "tiktok", "tik tok", "mashup", "remake",
+    "type beat", "version salsa", "versión salsa", "acoustic", "acústico",
+    "piano version", "guitar cover", "parodia", "parody"
+)
+
+_SEARCH_NOISE_WORDS = {
+    "official", "oficial", "audio", "video", "lyrics", "lyric", "letra", "visualizer",
+    "hd", "4k", "remastered", "remaster", "cancion", "canción", "canciones", "populares",
+    "mejores", "playlist", "radio", "mix", "musica", "música", "similar", "similares",
+    "tema", "temas", "rola", "rolas", "the", "and", "feat", "ft", "con"
+}
+
+
+def _normalize_youtube_url_for_play(raw: str) -> str:
+    """Convierte enlaces radio/playlist de YouTube a enlace directo del video.
+
+    Discord suele mandar links como:
+    https://www.youtube.com/watch?v=ID&list=RDID&start_radio=1
+    yt-dlp en Render a veces intenta tratarlo como playlist/radio y devuelve cero entradas.
+    Dejamos solo watch?v=ID para reproducir el video exacto.
+    """
+    url = str(raw or "").strip().strip("<>")
+    if not url:
+        return ""
+
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.netloc.lower().replace("www.", "")
+        path = parsed.path or ""
+        query = urllib.parse.parse_qs(parsed.query)
+
+        video_id = None
+        if "youtube.com" in host or "music.youtube.com" in host:
+            if path.startswith("/watch") and query.get("v"):
+                video_id = query.get("v", [""])[0]
+            elif path.startswith("/shorts/"):
+                video_id = path.split("/shorts/", 1)[1].split("/", 1)[0]
+            elif path.startswith("/embed/"):
+                video_id = path.split("/embed/", 1)[1].split("/", 1)[0]
+        elif "youtu.be" in host:
+            video_id = path.strip("/").split("/", 1)[0]
+
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+    except Exception:
+        pass
+
+    return url
+
+
+# Sobrescribe limpieza anterior.
+def _clean_search_query(query: str) -> str:
+    """Limpia búsquedas y arregla enlaces YouTube con playlist/radio."""
+    query = (query or "").strip()
+    if not query:
+        return ""
+
+    query = query.strip("<>")
+    if URL_REGEX.match(query):
+        return _normalize_youtube_url_for_play(query)[:500]
+
+    query = query.replace("—", "-").replace("–", "-")
+    # Evita que YouTube interprete '-artista' como exclusión.
+    query = re.sub(r"(?<=\w)\s*-\s*(?=\w)", " ", query)
+    query = re.sub(r"\s+", " ", query).strip()
+    return query[:180]
+
+
+def _query_is_direct_url(query: str) -> bool:
+    return bool(URL_REGEX.match(str(query or "").strip()))
+
+
+def _strip_search_prefix(query: str) -> str:
+    q = _clean_search_query(query)
+    q = re.sub(r"^(ytsearch|scsearch)\d*:", "", q, flags=re.IGNORECASE).strip()
+    return q
+
+
+def _meaningful_music_tokens(text: str) -> Set[str]:
+    cleaned = _strip_music_noise(_strip_search_prefix(text)).lower()
+    tokens = {
+        t for t in re.findall(r"[a-z0-9áéíóúüñ$]+", cleaned)
+        if len(t) > 1 and t not in _SEARCH_NOISE_WORDS
+    }
+    return tokens
+
+
+# Más estricto que el anterior: con búsquedas cortas exige todas las palabras importantes.
+def _is_too_weak_music_match(info: Dict, query: str) -> bool:
+    if not STRICT_MUSIC_MATCH:
+        return False
+    if _query_is_direct_url(query):
+        return False
+
+    q_tokens = _meaningful_music_tokens(query)
+    if not q_tokens:
+        return False
+
+    title = str(info.get("title") or "")
+    uploader = str(info.get("uploader") or info.get("channel") or "")
+    result_tokens = _meaningful_music_tokens(f"{title} {uploader}")
+    if not result_tokens:
+        return True
+
+    matched = q_tokens & result_tokens
+
+    # Si el usuario escribió una canción de 1-3 palabras, no aceptamos solo una palabra suelta.
+    if len(q_tokens) <= 3:
+        return not q_tokens.issubset(result_tokens)
+
+    return (len(matched) / max(1, len(q_tokens))) < 0.75
+
+
+def _query_wants_alt_version(query: str) -> bool:
+    q = str(query or "").lower()
+    return any(word in q for word in _ALT_VERSION_WORDS)
+
+
+# Sobrescribe filtro anterior para que play normal no acepte karaoke/instrumental si no se pidió.
+def _is_unwanted_music_version(info: Dict, query: str) -> bool:
+    if _query_is_direct_url(query):
+        # Si pegó un enlace directo, respetamos el enlace exacto.
+        return False
+
+    if _query_wants_alt_version(query):
+        return False
+
+    title = str(info.get("title") or "").lower()
+    uploader = str(info.get("uploader") or info.get("channel") or "").lower()
+    haystack = f"{title} {uploader}"
+    return any(word in haystack for word in _ALT_VERSION_WORDS)
+
+
+def build_music_searches(busqueda: str) -> List[str]:
+    """Búsquedas para play normal. URL directa se limpia y se reproduce directa."""
+    query = _clean_search_query(busqueda)
+    if not query:
+        return []
+    if _query_is_direct_url(query):
+        return [query]
+
+    negative = ""
+    if not _query_wants_alt_version(query):
+        negative = " -remix -cover -slowed -reverb -karaoke -live -instrumental -nightcore -sped -tiktok -remake"
+
+    searches = [
+        f"ytsearch6:{query}{negative}",
+        f"ytsearch6:{query} official audio{negative}",
+        f"ytsearch6:{query} audio oficial{negative}",
+        f"ytsearch6:{query} official video{negative}",
+        f"scsearch5:{query}",
+    ]
+    unique, seen = [], set()
+    for item in searches:
+        key = item.lower()
+        if key not in seen:
+            unique.append(item)
+            seen.add(key)
+    return unique
+
+
+def _search_value_for_ytdlp(clean_query: str, limit: int = 5) -> str:
+    if _query_is_direct_url(clean_query):
+        return clean_query
+    if re.match(r"^(ytsearch|scsearch)\d*:", clean_query, re.IGNORECASE):
+        # Si viene ytsearch: sin número, lo convertimos a ytsearchN: para tener alternativas.
+        return re.sub(r"^(ytsearch|scsearch):", lambda m: f"{m.group(1)}{limit}:", clean_query, flags=re.IGNORECASE)
+    return f"ytsearch{max(1, min(limit, 8))}:{clean_query}"
+
+
+async def extract_music_candidates_with_python_api(query: str, *, limit: int = 5) -> List[tuple]:
+    """Candidatos reproducibles, con URL limpia y poco ruido de yt-dlp."""
+    clean_query = _clean_search_query(query)
+    if not clean_query:
+        return []
+
+    search_value = _search_value_for_ytdlp(clean_query, limit=limit)
+    cookiefile = get_cookiefile_path()
+    # Para YouTube en Render normalmente cookies ayudan; para SoundCloud no hacen falta.
+    attempts = [True, False] if cookiefile and not search_value.lower().startswith("scsearch") else [False]
+    last_error = None
+
+    for use_cookies in attempts:
+        opts = dict(ydl_opts)
+        opts.pop("cookiefile", None)
+        opts.update({
+            "format": "bestaudio/best",
+            "default_search": "ytsearch",
+            "extract_flat": False,
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "ignore_no_formats_error": True,
+            "cachedir": False,
+            "logger": QuietYDLLogger(),
+        })
+        if use_cookies and cookiefile:
+            opts["cookiefile"] = cookiefile
+
+        try:
+            with youtube_dl.YoutubeDL(opts) as ydl:
+                timeout = int(os.getenv("YTDLP_API_TIMEOUT", "18"))
+                if limit <= 3:
+                    timeout = int(os.getenv("DJ_YTDLP_API_TIMEOUT", "7"))
+                info = await asyncio.wait_for(
+                    extract_info_async(ydl, search_value, download=False),
+                    timeout=timeout,
+                )
+
+            entries = _normalize_yt_dlp_dump(info)
+            candidates = []
+            for entry in entries:
+                audio_url = _pick_audio_url_from_info(entry)
+                if audio_url:
+                    candidates.append((entry, audio_url))
+            if candidates:
+                logger.info("yt-dlp devolvió %s candidato(s) para: %s", len(candidates), clean_query[:90])
+                return candidates
+            last_error = MusicSearchError("yt-dlp no devolvió candidatos con audio.")
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Extractor candidatos falló para '%s' (%s): %s", clean_query[:90], "cookies" if use_cookies else "sin cookies", str(exc)[:160])
+
+    if last_error:
+        raise MusicSearchError(str(last_error)[:300])
+    return []
+
+
+async def extract_music_with_python_api_bot18(query: str):
+    """Compatibilidad: devuelve el mejor candidato usando el método rápido."""
+    clean_query = _clean_search_query(query)
+    candidates = await extract_music_candidates_with_python_api(clean_query, limit=6 if not _query_is_direct_url(clean_query) else 1)
+    if not candidates:
+        raise MusicSearchError("yt-dlp no devolvió audio reproducible.")
+
+    base_query = _strip_search_prefix(clean_query)
+    direct = _query_is_direct_url(clean_query)
+    ranked = sorted(candidates, key=lambda pair: _score_music_candidate(pair[0], base_query), reverse=True)
+
+    for info, audio_url in ranked:
+        if not direct and _is_unwanted_music_version(info, base_query):
+            continue
+        if not direct and _is_too_weak_music_match(info, base_query):
+            continue
+        return info, audio_url
+
+    # Si era URL directa, respetamos el primer candidato; si no, fallamos para no poner basura.
+    if direct:
+        return ranked[0]
+    raise MusicSearchError("Encontré resultados, pero eran karaoke/remix o coincidían muy poco.")
+
+
+async def extract_music_legacy_like_bot18(query: str):
+    """Extractor robusto para play: URL directa limpia + búsquedas exactas + SoundCloud."""
+    clean_query = _clean_search_query(query)
+    last_error: Optional[BaseException] = None
+
+    for attempt in build_music_searches(clean_query):
+        try:
+            return await extract_music_with_python_api_bot18(attempt)
+        except Exception as exc:
+            last_error = exc
+            logger.warning("API no pudo resolver '%s': %s", attempt[:110], str(exc)[:180])
+            continue
+
+    logger.warning("API no pudo resolver '%s'; pruebo CLI EJS: %s", clean_query or query, str(last_error)[:220])
+    return await extract_music_with_cli_ejs(clean_query or query)
+
+
+async def resolve_song(
+    busqueda: str,
+    requested_by,
+    *,
+    max_duration: Optional[int] = None,
+    exclude_markers: Optional[Set[str]] = None,
+) -> Dict:
+    """Play normal: exacto, sin karaoke/remix salvo que el usuario lo pida, y URL de YouTube limpia."""
+    query = _clean_search_query(busqueda)
+    if not query:
+        raise MusicSearchError("Escribe el nombre o enlace de una canción.")
+
+    direct = _query_is_direct_url(query)
+    exclude_markers = set(exclude_markers or set())
+
+    try:
+        info, audio_url = await extract_music_legacy_like_bot18(query)
+        duration = _safe_int(info.get("duration"), 0)
+        if max_duration and duration and duration > max_duration:
+            raise MusicSearchError("La canción supera la duración máxima permitida.")
+
+        if not direct and _is_unwanted_music_version(info, query):
+            raise MusicSearchError("El resultado era karaoke/instrumental/remix y no fue pedido.")
+        if not direct and _is_too_weak_music_match(info, query):
+            raise MusicSearchError("El resultado coincidía muy poco con la búsqueda.")
+
+        song = {
+            "title": str(info.get("title") or query)[:100],
+            "url": audio_url,
+            "web_url": info.get("webpage_url") or info.get("original_url") or query,
+            "duration": duration,
+            "requested_by": requested_by,
+            "thumbnail": info.get("thumbnail") or "https://i.imgur.com/8Km9tLL.png",
+            "uploader": str(info.get("uploader") or info.get("channel") or "Artista desconocido")[:80],
+        }
+        if exclude_markers and (song_markers(song) & exclude_markers):
+            raise MusicSearchError("La canción ya está sonando, en cola o fue usada recientemente.")
+        logger.info("Canción resuelta con filtro final: %s", song["title"])
+        return song
+    except Exception as e:
+        logger.warning("Extractor final falló para '%s': %s", query, str(e)[:220])
+        raise MusicSearchError(
+            f"No pude obtener audio reproducible para `{query}`. "
+            "Si es YouTube en Render, puede ser bloqueo anti-bot/cookies. "
+            "Prueba enlace directo limpio o actualiza el Secret File cookies.txt."
+        ) from e
+
+
+def build_dj_fallback_terms(query: str, *, limit: int = 9) -> List[str]:
+    """Términos DJ seguros: nunca mutila `sal rosa` a `sal`."""
+    q = _clean_search_query(query)
+    if not q:
+        return []
+    if _query_is_direct_url(q):
+        return [q]
+
+    candidates: List[str] = [
+        f"{q} official audio",
+        q,
+        f"{q} audio oficial",
+    ]
+
+    seeds = _guess_artist_seeds_from_query(q)
+    for seed in seeds:
+        if _normalize_song_title(seed) == _normalize_song_title(q):
+            continue
+        # Solo usamos términos de artista si el seed realmente parece artista, no una palabra suelta.
+        if _looks_like_artist_seed(seed):
+            candidates.extend([
+                f"{seed} official audio",
+                f"{seed} canciones populares",
+                f"{seed} radio",
+            ])
+
+    candidates.extend([
+        f"{q} radio",
+        f"{q} canciones similares",
+    ])
+
+    unique, seen = [], set()
+    for term in candidates:
+        clean = _clean_search_query(term)
+        key = clean.lower()
+        if clean and key not in seen:
+            unique.append(clean)
+            seen.add(key)
+        if len(unique) >= max(1, limit):
+            break
+    logger.info("DJ términos finales para '%s': %s", q[:80], unique)
+    return unique
+
+
+async def resolve_dj_song(
+    busqueda: str,
+    requested_by,
+    *,
+    max_duration: Optional[int] = None,
+    exclude_markers: Optional[Set[str]] = None,
+    forbidden_phrases: Optional[Union[List[str], Set[str]]] = None,
+) -> Dict:
+    """DJ estricto: si el resultado no contiene las palabras clave, no mete basura."""
+    query = _clean_search_query(busqueda)
+    if not query:
+        raise MusicSearchError("Escribe el nombre o enlace de una canción.")
+
+    match_query = _dj_clean_match_query(query)
+    exclude_markers = set(exclude_markers or set())
+    forbidden_set = set(forbidden_phrases or [])
+    rejected: List[str] = []
+
+    candidates = []
+    try:
+        candidates = await extract_music_candidates_with_python_api(query, limit=3)
+    except Exception as exc:
+        rejected.append(f"candidatos: {str(exc)[:90]}")
+
+    ranked = sorted(candidates, key=lambda pair: _score_music_candidate(pair[0], match_query), reverse=True)
+    for info, audio_url in ranked:
+        duration = _safe_int(info.get("duration"), 0)
+        if max_duration and duration and duration > max_duration:
+            rejected.append("duración alta")
+            continue
+        if _is_unwanted_music_version(info, query):
+            rejected.append(f"versión no pedida: {str(info.get('title') or '')[:60]}")
+            continue
+        if _is_too_weak_music_match(info, match_query):
+            rejected.append(f"coincidencia débil: {str(info.get('title') or '')[:60]}")
+            continue
+
+        candidate = {
+            "title": str(info.get("title") or query)[:100],
+            "url": audio_url,
+            "web_url": info.get("webpage_url") or info.get("original_url") or query,
+            "duration": duration,
+            "requested_by": requested_by,
+            "thumbnail": info.get("thumbnail") or "https://i.imgur.com/8Km9tLL.png",
+            "uploader": str(info.get("uploader") or info.get("channel") or "Artista desconocido")[:80],
+        }
+        markers = song_markers(candidate)
+        if exclude_markers and markers and (markers & exclude_markers):
+            rejected.append(f"duplicado: {candidate['title']}")
+            continue
+        if _song_matches_forbidden_phrase(candidate, forbidden_set):
+            rejected.append(f"misma canción disfrazada: {candidate['title']}")
+            continue
+        logger.info("DJ canción elegida con filtro final: %s", candidate["title"])
+        return candidate
+
+    detail = "; ".join(rejected[-4:]) if rejected else "sin candidatos válidos"
+    raise MusicSearchError(f"No encontré una canción nueva para `{query}` sin repetir ni meter basura. Detalle: {detail}")
+
+
 if not TOKEN:
     raise RuntimeError("Falta DISCORD_TOKEN/discord_token. En Render crea la variable discord_token; localmente puedes usar .env con DISCORD_TOKEN.")
 
@@ -7972,3 +8442,4 @@ except Exception as e:
     logger.warning(f"No se pudo iniciar webserver keepalive: {e}")
 
 bot.run(TOKEN)
+
