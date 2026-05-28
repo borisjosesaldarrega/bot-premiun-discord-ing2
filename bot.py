@@ -395,11 +395,55 @@ FFMPEG_OPTIONS = {
 # Opciones para yt-dlp.
 # Restauradas con la lógica del bot 18 porque en Render era la que sí encontraba música rápido.
 # La lógica nueva de estrategias múltiples estaba saltando resultados válidos de YouTube.
+def _cookiefile_has_youtube_cookie(cookie_path: str) -> bool:
+    """Valida rápido que el archivo de cookies sí tenga cookies de YouTube.
+
+    Render puede tener un cookies.txt viejo en el repo y otro correcto en
+    /etc/secrets/cookies.txt. Si agarramos el viejo, yt-dlp se queda sin
+    entradas aunque el enlace esté bien.
+    """
+    try:
+        if not cookie_path or not os.path.exists(cookie_path):
+            return False
+        if os.path.getsize(cookie_path) < 50:
+            return False
+        with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
+            sample = f.read(250_000).lower()
+        return ("youtube.com" in sample or ".youtube.com" in sample or "googlevideo.com" in sample)
+    except Exception:
+        return False
+
+
 def get_cookiefile_path() -> Optional[str]:
-    """Devuelve cookies.txt local o el Secret File de Render si existe."""
-    for cookie_path in ("cookies.txt", "/etc/secrets/cookies.txt"):
-        if os.path.exists(cookie_path):
+    """Devuelve cookies válidas priorizando Render Secret Files.
+
+    IMPORTANTE: en Render el Secret File vive en /etc/secrets/cookies.txt.
+    Si existe un cookies.txt en el repo, puede estar viejo o ser de ejemplo;
+    por eso NO debe tener prioridad.
+    """
+    candidates = []
+
+    env_cookie = (os.getenv("YTDLP_COOKIES_FILE") or os.getenv("COOKIES_FILE") or "").strip()
+    if env_cookie:
+        candidates.append(env_cookie)
+
+    # Render Secret File primero. Este debe ser el bueno.
+    candidates.append("/etc/secrets/cookies.txt")
+
+    # Local/repo solo como respaldo; idealmente NO debe subirse a GitHub.
+    candidates.append("cookies.txt")
+
+    seen = set()
+    for cookie_path in candidates:
+        if not cookie_path or cookie_path in seen:
+            continue
+        seen.add(cookie_path)
+        if not os.path.exists(cookie_path):
+            continue
+        if _cookiefile_has_youtube_cookie(cookie_path):
             return cookie_path
+        logger.warning("Ignoro cookies inválidas/no YouTube en: %s", cookie_path)
+
     return None
 
 
@@ -416,6 +460,10 @@ ydl_opts = {
     'restrictfilenames': True,
     'nocheckcertificate': True,
     'source_address': '0.0.0.0',
+    'http_headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134 Safari/537.36',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+    },
     'logger': QuietYDLLogger(),
     # Mantengo también las keys antiguas porque el bot 18 funcionaba así.
     'geo-bypass': True,
@@ -8727,13 +8775,40 @@ async def _extract_music_old_brutal(query: str, *, search_limit: int = 1):
 
 
 def _youtube_url_variants_for_play(raw_url: str) -> List[str]:
-    """Devuelve variantes de URL: cruda primero y limpia después."""
+    """Devuelve variantes de URL: cruda, limpia, y formatos alternos.
+
+    Algunos enlaces de Discord vienen como radio/playlist. Además, en Render
+    a veces una forma del enlace falla y otra forma sí entrega metadata/audio.
+    """
     raw = str(raw_url or "").strip().strip("<>")
     clean = _normalize_youtube_url_for_play(raw) if '_normalize_youtube_url_for_play' in globals() else raw
-    variants = []
-    for item in (raw, clean):
+    variants: List[str] = []
+
+    def add(item: str):
+        item = str(item or "").strip()
         if item and item not in variants:
             variants.append(item)
+
+    add(raw)
+    add(clean)
+
+    try:
+        parsed = urllib.parse.urlparse(clean or raw)
+        host = parsed.netloc.lower().replace("www.", "")
+        query = urllib.parse.parse_qs(parsed.query)
+        video_id = None
+        if "youtube.com" in host and query.get("v"):
+            video_id = query.get("v", [""])[0]
+        elif "youtu.be" in host:
+            video_id = parsed.path.strip("/").split("/", 1)[0]
+
+        if video_id:
+            add(f"https://youtu.be/{video_id}")
+            add(f"https://music.youtube.com/watch?v={video_id}")
+            add(f"https://www.youtube.com/watch?v={video_id}&bpctr=9999999999&has_verified=1")
+    except Exception:
+        pass
+
     return variants
 
 
@@ -8761,11 +8836,13 @@ async def _extract_music_from_title_fallback(url: str):
     logger.info("URL directa bloqueada; intento por título alternativo flexible: %s", search_title[:120])
 
     attempts = [
-        f"ytsearch10:{search_title}",
+        # Cuando el video directo está bloqueado en Render, SoundCloud suele ser
+        # el respaldo más rápido porque no pelea con el anti-bot de YouTube.
+        f"scsearch8:{search_title}",
         f"ytsearch10:{search_title} official audio",
+        f"ytsearch10:{search_title}",
         f"ytsearch10:{search_title} official video",
         f"ytsearch10:{search_title} audio oficial",
-        f"scsearch8:{search_title}",
     ]
 
     last_error = None
