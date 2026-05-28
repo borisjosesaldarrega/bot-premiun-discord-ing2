@@ -8635,6 +8635,264 @@ async def resolve_song(
         ) from e
 
 
+
+# ===============================================================
+# FIX FINAL URL / PLAY ESTILO BOT VIEJO
+# ===============================================================
+# Motivo:
+# El bot viejo reproducía URLs porque hacía exactamente esto:
+#   ydl.extract_info(URL) -> entries[0] -> info["url"]/formats -> FFmpeg
+# sin filtros estrictos ni búsquedas negativas. Esta capa restaura ese
+# comportamiento SOLO para enlaces directos y mantiene filtros estrictos para
+# búsquedas normales y DJ.
+
+def _youtube_id_from_url_for_fallback(url: str) -> Optional[str]:
+    """Extrae el ID de YouTube para limpiar enlaces con playlist/radio."""
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip().strip("<>"))
+        host = parsed.netloc.lower().replace("www.", "")
+        path = parsed.path or ""
+        query = urllib.parse.parse_qs(parsed.query)
+
+        if "youtube.com" in host or "music.youtube.com" in host:
+            if query.get("v"):
+                return query["v"][0]
+            if path.startswith("/shorts/"):
+                return path.split("/shorts/", 1)[1].split("/", 1)[0]
+            if path.startswith("/embed/"):
+                return path.split("/embed/", 1)[1].split("/", 1)[0]
+        if "youtu.be" in host:
+            return path.strip("/").split("/", 1)[0]
+    except Exception:
+        return None
+    return None
+
+
+def _clean_direct_youtube_url_oldstyle(url: str) -> str:
+    """Deja solo watch?v=ID para que yt-dlp no trate links RD como radio/playlist."""
+    video_id = _youtube_id_from_url_for_fallback(url)
+    if video_id:
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return str(url or "").strip().strip("<>")
+
+
+async def _extract_oldstyle_first_playable(query: str, *, use_cookies: bool = True, search_limit: int = 1):
+    """Extractor simple estilo bot viejo: toma la primera entrada reproducible.
+
+    Esta función existe porque para URLs directas el flujo anterior del bot era más tolerante:
+    no filtraba por coincidencia, no rechazaba fan videos y no convertía todo en una búsqueda
+    estricta. Si YouTube entrega audio, esto lo aprovecha rápido.
+    """
+    clean = _clean_search_query(query)
+    if not clean:
+        raise MusicSearchError("Consulta vacía.")
+
+    is_url = _query_is_direct_url(clean)
+    search_value = clean if is_url else f"ytsearch{max(1, min(search_limit, 8))}:{clean}"
+
+    cookiefile = get_cookiefile_path()
+    attempts = [True, False] if (use_cookies and cookiefile and not search_value.lower().startswith("scsearch")) else [False]
+    last_error: Optional[BaseException] = None
+
+    for cookie_attempt in attempts:
+        opts = dict(ydl_opts)
+        opts.pop("cookiefile", None)
+        opts.update({
+            "format": "bestaudio/best",
+            "default_search": "ytsearch",
+            "noplaylist": True,
+            "extract_flat": False,
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "ignore_no_formats_error": True,
+            "cachedir": False,
+            "logger": QuietYDLLogger(),
+            # Varios clientes ayudan cuando YouTube le da formatos raros a datacenters.
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web", "tv"]
+                }
+            },
+        })
+        if cookie_attempt and cookiefile:
+            opts["cookiefile"] = cookiefile
+
+        try:
+            with youtube_dl.YoutubeDL(opts) as ydl:
+                info = await asyncio.wait_for(
+                    extract_info_async(ydl, search_value, download=False),
+                    timeout=int(os.getenv("YTDLP_API_TIMEOUT", "18"))
+                )
+
+            entries = _normalize_yt_dlp_dump(info)
+            if not entries:
+                raise MusicSearchError("yt-dlp no devolvió entradas.")
+
+            for entry in entries:
+                audio_url = _pick_audio_url_from_info(entry)
+                if audio_url:
+                    logger.info(
+                        "Canción resuelta con extractor viejo directo (%s): %s",
+                        "cookies" if cookie_attempt else "sin cookies",
+                        str(entry.get("title") or clean)[:100],
+                    )
+                    return entry, audio_url
+
+            raise MusicSearchError("yt-dlp devolvió entradas, pero ninguna con audio.")
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Extractor viejo directo falló para '%s' (%s): %s",
+                search_value[:110],
+                "cookies" if cookie_attempt else "sin cookies",
+                str(exc)[:180],
+            )
+
+    raise MusicSearchError(str(last_error or "No hubo audio reproducible."))
+
+
+async def _extract_music_from_title_fallback_relaxed(url: str):
+    """Fallback por título, menos rígido para rescatar URLs que YouTube bloquea en Render."""
+    title = await _fetch_youtube_title_from_oembed(url)
+    search_title = _title_to_music_search(title or "")
+    if not search_title:
+        raise MusicSearchError("No pude obtener título alternativo del enlace de YouTube.")
+
+    logger.info("URL directa bloqueada; intento por título alternativo flexible: %s", search_title[:120])
+
+    attempts = [
+        f"{search_title} official audio",
+        f"{search_title} audio oficial",
+        f"{search_title} official video",
+        search_title,
+        f"scsearch5:{search_title}",
+    ]
+
+    last_error: Optional[BaseException] = None
+    for attempt in attempts:
+        try:
+            # Primero intento simple/viejo, porque es el que mejor se comportaba con URLs.
+            info, audio_url = await _extract_oldstyle_first_playable(attempt, use_cookies=True, search_limit=5)
+
+            # Para fallback de URL sí evitamos karaoke/remix si NO venía pedido en el título,
+            # pero no aplicamos el filtro de coincidencia extrema porque el título puede venir
+            # sucio por embeds/fan videos.
+            if _is_unwanted_music_version(info, search_title):
+                last_error = MusicSearchError("Resultado alternativo era karaoke/remix/instrumental.")
+                continue
+
+            logger.info("URL resuelta por título flexible: %s", str(info.get("title") or search_title)[:100])
+            return info, audio_url
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Fallback flexible por título falló para '%s': %s", attempt[:100], str(exc)[:160])
+
+    raise MusicSearchError(str(last_error or "No hubo audio por título alternativo."))
+
+
+_previous_extract_music_legacy_url_fix = extract_music_legacy_like_bot18
+
+
+async def extract_music_legacy_like_bot18(query: str):
+    """Extractor final real.
+
+    - URL directa: intenta primero método viejo directo.
+    - Si YouTube bloquea esa URL: rescata por título oEmbed.
+    - Búsqueda normal/DJ: usa la lógica estricta anterior.
+    """
+    clean_query = _clean_search_query(query)
+    is_direct = _query_is_direct_url(clean_query)
+
+    if is_direct:
+        direct_url = _clean_direct_youtube_url_oldstyle(clean_query)
+        try:
+            return await _extract_oldstyle_first_playable(direct_url, use_cookies=True, search_limit=1)
+        except Exception as direct_error:
+            logger.warning("URL directa falló con método viejo; intento rescate por título: %s", str(direct_error)[:180])
+
+            if "youtube.com" in direct_url.lower() or "youtu.be" in direct_url.lower():
+                try:
+                    return await _extract_music_from_title_fallback_relaxed(direct_url)
+                except Exception as title_error:
+                    logger.warning(
+                        "URL YouTube falló directo y por título flexible. Directo=%s | título=%s",
+                        str(direct_error)[:180],
+                        str(title_error)[:180],
+                    )
+                    # Último intento: CLI EJS sobre URL limpia.
+                    try:
+                        return await extract_music_with_cli_ejs(direct_url)
+                    except Exception as cli_error:
+                        raise MusicSearchError(str(cli_error)) from title_error
+
+            raise MusicSearchError(str(direct_error)) from direct_error
+
+    return await _previous_extract_music_legacy_url_fix(clean_query or query)
+
+
+async def resolve_song(
+    busqueda: str,
+    requested_by,
+    *,
+    max_duration: Optional[int] = None,
+    exclude_markers: Optional[Set[str]] = None,
+) -> Dict:
+    """Resolve final: URL directa estilo bot viejo + filtros para búsqueda normal."""
+    query = _clean_search_query(busqueda)
+    if not query:
+        raise MusicSearchError("Escribe el nombre o enlace de una canción.")
+
+    direct = _query_is_direct_url(query)
+    exclude_markers = set(exclude_markers or set())
+
+    try:
+        info, audio_url = await extract_music_legacy_like_bot18(query)
+        duration = _safe_int(info.get("duration"), 0)
+
+        if max_duration and duration and duration > max_duration:
+            raise MusicSearchError("La canción supera la duración máxima permitida.")
+
+        # Para enlace directo respetamos la URL o su fallback por título.
+        # Para búsqueda normal seguimos evitando karaoke/remix basura.
+        if not direct:
+            if _is_unwanted_music_version(info, query):
+                raise MusicSearchError("El resultado era karaoke/instrumental/remix y no fue pedido.")
+            if _is_too_weak_music_match(info, query):
+                raise MusicSearchError("El resultado coincidía muy poco con la búsqueda.")
+        else:
+            # Si el enlace directo cayó a título alternativo, evitamos karaoke/instrumental evidentes.
+            title = str(info.get("title") or "")
+            if any(w in title.lower() for w in ("karaoke", "instrumental")) and not _query_wants_alt_version(str(busqueda)):
+                logger.warning("URL/fallback devolvió karaoke/instrumental; se rechaza: %s", title[:100])
+                raise MusicSearchError("El enlace/fallback devolvió karaoke o instrumental.")
+
+        song = {
+            "title": str(info.get("title") or query)[:100],
+            "url": audio_url,
+            "web_url": info.get("webpage_url") or info.get("original_url") or query,
+            "duration": duration,
+            "requested_by": requested_by,
+            "thumbnail": info.get("thumbnail") or "https://i.imgur.com/8Km9tLL.png",
+            "uploader": str(info.get("uploader") or info.get("channel") or "Artista desconocido")[:80],
+        }
+
+        if exclude_markers and (song_markers(song) & exclude_markers):
+            raise MusicSearchError("La canción ya está sonando, en cola o fue usada recientemente.")
+
+        logger.info("Canción resuelta con URL oldstyle final: %s", song["title"])
+        return song
+
+    except Exception as e:
+        logger.warning("Resolver final URL oldstyle falló para '%s': %s", query, str(e)[:220])
+        raise MusicSearchError(
+            f"No pude obtener audio reproducible para `{query}`. "
+            "Si es URL de YouTube en Render, esa fuente puede estar bloqueada por IP/cookies. "
+            "Probé método viejo, título alternativo y CLI/EJS."
+        ) from e
+
+
+
 if not TOKEN:
     raise RuntimeError("Falta DISCORD_TOKEN/discord_token. En Render crea la variable discord_token; localmente puedes usar .env con DISCORD_TOKEN.")
 
