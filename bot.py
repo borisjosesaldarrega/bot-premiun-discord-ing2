@@ -396,12 +396,7 @@ FFMPEG_OPTIONS = {
 # Restauradas con la lógica del bot 18 porque en Render era la que sí encontraba música rápido.
 # La lógica nueva de estrategias múltiples estaba saltando resultados válidos de YouTube.
 def _cookiefile_has_youtube_cookie(cookie_path: str) -> bool:
-    """Valida rápido que el archivo de cookies sí tenga cookies de YouTube.
-
-    Render puede tener un cookies.txt viejo en el repo y otro correcto en
-    /etc/secrets/cookies.txt. Si agarramos el viejo, yt-dlp se queda sin
-    entradas aunque el enlace esté bien.
-    """
+    """Valida rápido que el archivo de cookies sí tenga cookies de YouTube."""
     try:
         if not cookie_path or not os.path.exists(cookie_path):
             return False
@@ -414,14 +409,68 @@ def _cookiefile_has_youtube_cookie(cookie_path: str) -> bool:
         return False
 
 
+_COOKIE_RUNTIME_CACHE: Dict[str, Dict[str, Union[str, float, int]]] = {}
+
+
+def _writable_cookiefile_copy(cookie_path: str) -> Optional[str]:
+    """Copia cookies a /tmp para que yt-dlp pueda leer/escribir sin romper Render.
+
+    Render monta /etc/secrets como solo lectura. yt-dlp a veces intenta actualizar
+    cookies durante la extracción; si le pasamos /etc/secrets/cookies.txt directo,
+    falla con: [Errno 30] Read-only file system.
+    """
+    try:
+        if not cookie_path or not os.path.exists(cookie_path):
+            return None
+
+        source_path = os.path.abspath(cookie_path)
+        stat = os.stat(source_path)
+        cached = _COOKIE_RUNTIME_CACHE.get(source_path)
+        if (
+            cached
+            and cached.get("mtime") == stat.st_mtime
+            and cached.get("size") == stat.st_size
+            and cached.get("runtime")
+            and os.path.exists(str(cached.get("runtime")))
+        ):
+            return str(cached["runtime"])
+
+        runtime_dir = "/tmp/archeon_ytdlp"
+        os.makedirs(runtime_dir, exist_ok=True)
+
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", os.path.basename(source_path) or "cookies.txt")
+        if source_path.startswith("/etc/secrets/"):
+            safe_name = "render_secret_" + safe_name
+        runtime_path = os.path.join(runtime_dir, safe_name)
+
+        shutil.copyfile(source_path, runtime_path)
+        try:
+            os.chmod(runtime_path, 0o600)
+        except Exception:
+            pass
+
+        _COOKIE_RUNTIME_CACHE[source_path] = {
+            "runtime": runtime_path,
+            "mtime": stat.st_mtime,
+            "size": stat.st_size,
+        }
+
+        if source_path.startswith("/etc/secrets/"):
+            logger.info("Cookies secret copiadas a ruta escribible para yt-dlp: %s", runtime_path)
+
+        return runtime_path
+    except Exception as exc:
+        logger.warning("No pude preparar copia escribible de cookies '%s': %s", cookie_path, str(exc)[:180])
+        return None
+
+
 def get_cookiefile_path() -> Optional[str]:
     """Devuelve cookies válidas priorizando Render Secret Files.
 
-    IMPORTANTE: en Render el Secret File vive en /etc/secrets/cookies.txt.
-    Si existe un cookies.txt en el repo, puede estar viejo o ser de ejemplo;
-    por eso NO debe tener prioridad.
+    En Render el Secret File vive en /etc/secrets/cookies.txt, pero ese directorio
+    es read-only. Por eso devolvemos una copia escribible en /tmp/archeon_ytdlp/.
     """
-    candidates = []
+    candidates: List[str] = []
 
     env_cookie = (os.getenv("YTDLP_COOKIES_FILE") or os.getenv("COOKIES_FILE") or "").strip()
     if env_cookie:
@@ -440,9 +489,16 @@ def get_cookiefile_path() -> Optional[str]:
         seen.add(cookie_path)
         if not os.path.exists(cookie_path):
             continue
-        if _cookiefile_has_youtube_cookie(cookie_path):
-            return cookie_path
-        logger.warning("Ignoro cookies inválidas/no YouTube en: %s", cookie_path)
+
+        if not _cookiefile_has_youtube_cookie(cookie_path):
+            logger.warning("Ignoro cookies inválidas/no YouTube en: %s", cookie_path)
+            continue
+
+        writable = _writable_cookiefile_copy(cookie_path)
+        if writable and _cookiefile_has_youtube_cookie(writable):
+            return writable
+
+        logger.warning("Cookies válidas, pero no pude crear copia escribible: %s", cookie_path)
 
     return None
 
@@ -6771,7 +6827,13 @@ async def ship_slash(interaction: discord.Interaction, usuario1: discord.Member,
 @bot.tree.command(name="play", description="Alias de /reproducir para poner música")
 @app_commands.describe(busqueda="Nombre, URL o búsqueda de la canción")
 async def play_alias_slash(interaction: discord.Interaction, busqueda: str):
-    await play_slash(interaction, busqueda=busqueda)
+    # @bot.tree.command convierte play_slash en un objeto Command.
+    # Para reutilizar /reproducir desde /play, hay que llamar a su callback real.
+    callback = getattr(play_slash, "callback", None)
+    if callback is not None:
+        await callback(interaction, busqueda=busqueda)
+    else:
+        await play_slash(interaction, busqueda=busqueda)
 
 
 @bot.tree.command(name="unirse", description="Hace que el bot entre a tu canal de voz")
@@ -8856,11 +8918,18 @@ async def _extract_music_from_title_fallback(url: str):
             if _is_unwanted_music_version(info, search_title):
                 last_error = MusicSearchError(f"Resultado alternativo era versión no pedida: {info.get('title')}")
                 continue
-            if _is_too_weak_music_match(info, search_title):
-                last_error = MusicSearchError(f"Resultado alternativo coincidía poco: {info.get('title')}")
+            score = _score_music_candidate(info, search_title)
+            min_score = int(os.getenv("URL_TITLE_FALLBACK_MIN_SCORE", "12"))
+
+            # Para URLs directas bloqueadas por YouTube/Render somos un poco más permisivos:
+            # si el enlace exacto murió, es mejor rescatar un resultado por título plausible
+            # que fallar aunque haya una versión correcta por nombre.
+            if _is_too_weak_music_match(info, search_title) and score < min_score:
+                last_error = MusicSearchError(
+                    f"Resultado alternativo coincidía poco: {info.get('title')} | score={score}"
+                )
                 continue
 
-            score = _score_music_candidate(info, search_title)
             if score > best_score:
                 best_candidate = (info, audio_url)
                 best_score = score
@@ -8979,3 +9048,4 @@ async def resolve_song(
 
 
 bot.run(TOKEN)
+
