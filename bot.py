@@ -235,7 +235,11 @@ voice_connection_attempts: Dict[int, float] = {}  # evita limpiar cola durante f
 # Voz estable: guarda el último canal y evita que el bot se baje solo mientras hay música.
 last_voice_channel_ids: Dict[int, int] = {}
 last_text_channel_ids: Dict[int, int] = {}  # último canal de texto útil para avisos de voz
+# Canal de texto donde empezó la música/DJ. Sirve para avisar desconexiones en el lugar correcto.
+music_origin_channels: Dict[int, int] = {}
 voice_stay_connected_guilds: Set[int] = set()
+# Base del resolve anterior usada por parches DJ; se inicializa para evitar NameError/Pylance.
+_resolve_song_base_for_dj = None
 
 # Por defecto NO se autodesconecta. Si quieres activar autodesconexión por soledad:
 # AUTO_VOICE_DISCONNECT=true en .env
@@ -382,6 +386,13 @@ def ffmpeg_version_line(executable: str) -> str:
 
 FFMPEG_EXECUTABLE = resolve_ffmpeg_executable()
 logger.info("FFmpeg seleccionado: %s | %s", FFMPEG_EXECUTABLE, ffmpeg_version_line(FFMPEG_EXECUTABLE))
+
+def check_ffmpeg() -> None:
+    """Verifica FFmpeg sin detener el bot."""
+    if not (os.path.exists(FFMPEG_EXECUTABLE) or shutil.which(FFMPEG_EXECUTABLE)):
+        logger.error("FFmpeg no encontrado: %s", FFMPEG_EXECUTABLE)
+
+check_ffmpeg()
 DEFAULT_GUILD_VOLUME = 0.90
 guild_volumes: Dict[int, float] = {}
 
@@ -1215,9 +1226,25 @@ async def update_last_activity(guild_id: int) -> None:
     last_activity[guild_id] = time.time()
     logger.debug(f"Actividad actualizada para guild {guild_id} - {last_activity[guild_id]}")
 
+
+def remember_music_origin(ctx_or_interaction) -> None:
+    """Guarda el canal de texto donde se inició música/DJ para avisos posteriores."""
+    try:
+        guild = getattr(ctx_or_interaction, "guild", None)
+        channel = getattr(ctx_or_interaction, "channel", None)
+        if guild and channel and isinstance(channel, discord.TextChannel):
+            music_origin_channels[guild.id] = channel.id
+            last_text_channel_ids[guild.id] = channel.id
+            session = dj_sessions.get(guild.id) if isinstance(dj_sessions, dict) else None
+            if isinstance(session, dict):
+                session["origin_channel"] = channel.id
+    except Exception:
+        logger.debug("No pude guardar canal de origen de música", exc_info=True)
+
 async def get_voice_notice_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     """Busca el mejor canal de texto para avisar por qué el bot se desconectó."""
     candidate_ids = [
+        music_origin_channels.get(guild.id) if 'music_origin_channels' in globals() else None,
         last_text_channel_ids.get(guild.id),
         TICKET_LOG_CHANNEL_ID if 'TICKET_LOG_CHANNEL_ID' in globals() else None,
         WELCOME_CHANNEL_ID if 'WELCOME_CHANNEL_ID' in globals() else None,
@@ -1250,30 +1277,64 @@ async def disconnect_voice_with_notice(
     reason: str,
     idle_seconds: float,
     humans_count: int,
+    manual: bool = False,
 ) -> None:
-    """Desconecta de voz y avisa en texto sin romper el bot si faltan permisos."""
+    """Desconecta de voz y avisa en el canal de texto donde empezó la música."""
     guild_id = guild.id
     voice_channel_name = getattr(getattr(voice_client, 'channel', None), 'name', 'canal de voz')
-    minutes = max(1, int(idle_seconds // 60))
+    minutes = max(0, int(idle_seconds // 60))
+
+    target_channel_id = None
+    if 'music_origin_channels' in globals():
+        target_channel_id = music_origin_channels.get(guild_id)
+    target_channel_id = target_channel_id or last_text_channel_ids.get(guild_id)
+
+    target_channel = None
+    if target_channel_id:
+        target_channel = guild.get_channel(target_channel_id) or bot.get_channel(target_channel_id)
+    if not isinstance(target_channel, discord.TextChannel):
+        target_channel = await get_voice_notice_channel(guild)
+
+    if manual:
+        farewell_msg = random.choice([
+            "🤨 No hacía falta empujar, yo también sé salir solito.",
+            "😤 Me retiro con dignidad... y con la playlist bajo el brazo.",
+            "🙄 Bueno, bueno, ya entendí la indirecta del siglo.",
+            "😎 Me voy antes de que digan que me echaron; fue decisión artística.",
+        ])
+        title = "👋 Me retiré del canal de voz"
+        color = discord.Color.purple()
+    else:
+        farewell_msg = await generate_goodbye_message(reason)
+        title = "🔌 Me desconecté de voz"
+        color = discord.Color.orange()
+
+    details = [
+        f"{farewell_msg}",
+        "",
+        f"📢 Canal de voz: **{voice_channel_name}**",
+        f"📌 Motivo: **{reason}**",
+        f"👥 Usuarios humanos en llamada: **{humans_count}**",
+    ]
+    if idle_seconds > 0:
+        details.insert(4, f"⏱️ Tiempo sin actividad: **{max(1, minutes)} min**")
+    details.extend([
+        "",
+        "Cuando quieran música otra vez, usen `¡play`, `¡dj` o `/play`.",
+    ])
 
     embed = discord.Embed(
-        title="🔌 Me desconecté de voz",
-        description=(
-            f"Salí de **{voice_channel_name}** porque **{reason}**.\n\n"
-            f"⏱️ Tiempo sin actividad: **{minutes} min**\n"
-            f"👥 Usuarios humanos en llamada: **{humans_count}**\n\n"
-            "Cuando quieran música otra vez, usen `¡play`, `¡dj` o `/play`."
-        ),
-        color=discord.Color.orange()
+        title=title,
+        description="\n".join(details),
+        color=color,
     )
-    embed.set_footer(text="Archeon • Limpieza automática de voz")
+    embed.set_footer(text="Archeon • Sistema de voz")
 
-    channel = await get_voice_notice_channel(guild)
-    if channel:
+    if target_channel:
         try:
-            await channel.send(embed=embed)
+            await target_channel.send(embed=embed)
         except Exception:
-            logger.warning(f"No pude enviar aviso de autodesconexión en {guild.name}: {traceback.format_exc()}")
+            logger.warning(f"No pude enviar aviso de desconexión en {guild.name}: {traceback.format_exc()}")
 
     try:
         await voice_client.disconnect(force=True)
@@ -1285,6 +1346,8 @@ async def disconnect_voice_with_notice(
     queues.pop(guild_id, None)
     last_activity.pop(guild_id, None)
     voice_stay_connected_guilds.discard(guild_id)
+    if 'music_origin_channels' in globals():
+        music_origin_channels.pop(guild_id, None)
 
     if guild_id in dj_sessions:
         dj_sessions[guild_id]["active"] = False
@@ -1292,8 +1355,7 @@ async def disconnect_voice_with_notice(
     if task and not task.done():
         task.cancel()
 
-    logger.info(f"Auto-desconectado de voz en {guild.name}: {reason}")
-
+    logger.info(f"Desconectado de voz en {guild.name}: {reason}")
 
 async def check_empty_voice_channels():
     """
@@ -2546,6 +2608,7 @@ async def join(ctx: commands.Context) -> None:
 @bot.command(name='play' , aliases=['p', 'reproduce', 'ponme', 'reproducir', 'PLAY'])
 async def play(ctx: commands.Context, *, busqueda: str) -> None:
     """Reproduce música o la añade a la cola"""
+    remember_music_origin(ctx)
     if not check_same_voice_channel(ctx):
         return await ctx.send("❌ Debes estar en el mismo canal de voz que el bot para usar este comando.")
     await update_last_activity(ctx.guild.id)
@@ -2715,13 +2778,24 @@ async def queue(ctx: commands.Context) -> None:
 
 @bot.command(name='desconectar', aliases=['disconnect', 'leave', 'salir'])
 async def disconnect(ctx: commands.Context) -> None:
-    """Desconecta al bot del canal de voz"""
-    if ctx.voice_client:
-        await ctx.voice_client.disconnect()
-        await ctx.send("Desconectado del canal de voz")
-    else:
-        await ctx.send("No estoy conectado a ningún canal de voz")
+    """Desconecta al bot del canal de voz con aviso en el canal donde inició la música."""
+    remember_music_origin(ctx)
+    voice_client = ctx.voice_client
+    if not voice_client or not voice_client.is_connected():
+        return await ctx.send("No estoy conectado a ningún canal de voz")
 
+    if ctx.author.voice and ctx.author.voice.channel != voice_client.channel:
+        return await ctx.send("❌ Debes estar en el mismo canal de voz para desconectarme.")
+
+    humans_count = len([m for m in getattr(voice_client.channel, "members", []) if not getattr(m, "bot", False)])
+    await disconnect_voice_with_notice(
+        ctx.guild,
+        voice_client,
+        reason="me desconectaron manualmente",
+        idle_seconds=0,
+        humans_count=humans_count,
+        manual=True,
+    )
 
 @bot.command(name='mezclar', aliases=['shuffle'])
 async def shuffle_queue(ctx: commands.Context) -> None:
@@ -2947,6 +3021,7 @@ async def show_history(ctx: commands.Context, date: Optional[str] = None) -> Non
 @bot.command(name='dj', aliases=['radio', 'mix'])
 async def dj_mode(ctx: commands.Context, *, query: str = None):
     """Modo DJ profesional con reproducción automática y sugerencias inteligentes"""
+    remember_music_origin(ctx)
     if not check_same_voice_channel(ctx):
         return await ctx.send("❌ Debes estar en el mismo canal de voz que el bot.")
 
@@ -5756,6 +5831,7 @@ async def ayuda_slash(interaction: discord.Interaction):
 async def play_slash(interaction: discord.Interaction, busqueda: str):
     """Reproduce música o la añade a la cola (versión slash command mejorada)."""
     try:
+        remember_music_origin(interaction)
         if not interaction.user.voice:
             embed = discord.Embed(
                 title="❌ Error de Voz",
@@ -5919,12 +5995,25 @@ async def queue_slash(ctx: discord.Interaction):
 
 @bot.tree.command(name="desconectar", description="Desconecta el bot del canal de voz")
 async def disconnect_command(ctx: discord.Interaction):
-    if ctx.guild.voice_client:
-        await ctx.guild.voice_client.disconnect()
-        await ctx.response.send_message("Desconectado del canal de voz")
-    else:
-        await ctx.response.send_message("No estoy conectado a ningún canal de voz", ephemeral=True)
+    remember_music_origin(ctx)
+    voice_client = ctx.guild.voice_client if ctx.guild else None
+    if not voice_client or not voice_client.is_connected():
+        return await ctx.response.send_message("No estoy conectado a ningún canal de voz", ephemeral=True)
 
+    if ctx.user.voice and ctx.user.voice.channel != voice_client.channel:
+        return await ctx.response.send_message("❌ Debes estar en el mismo canal de voz para desconectarme.", ephemeral=True)
+
+    await ctx.response.defer(ephemeral=True)
+    humans_count = len([m for m in getattr(voice_client.channel, "members", []) if not getattr(m, "bot", False)])
+    await disconnect_voice_with_notice(
+        ctx.guild,
+        voice_client,
+        reason="me desconectaron manualmente",
+        idle_seconds=0,
+        humans_count=humans_count,
+        manual=True,
+    )
+    await ctx.followup.send("👋 Me retiré con estilo. Dejé el aviso en el canal donde empezó la música.", ephemeral=True)
 
 @bot.tree.command(name="mezclar", description="Mezcla aleatoriamente la cola de música")
 async def shuffle_slash(ctx: discord.Interaction):
@@ -6541,6 +6630,44 @@ async def olvidar_slash(ctx: discord.Interaction):
     if user_id in chat_histories:
         chat_histories[user_id] = []
     await ctx.response.send_message("🔄 ¡He reiniciado nuestra conversación! ¿En qué puedo ayudarte ahora?")
+
+
+@bot.command(name='separar')
+@commands.has_permissions(move_members=True, manage_channels=True)
+async def separar_jugadores(ctx: commands.Context):
+    """Separa usuarios por juego en canales de voz."""
+    try:
+        if not ctx.guild:
+            return await ctx.send("❌ Este comando solo funciona en servidores.")
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            return await ctx.send("❌ Debes estar en un canal de voz para usar este comando.")
+
+        voice_channel = ctx.author.voice.channel
+        juegos_activos: Dict[str, List[discord.Member]] = {}
+        for member in voice_channel.members:
+            activity = getattr(member, "activity", None)
+            if activity and getattr(activity, "type", None) == discord.ActivityType.playing:
+                juegos_activos.setdefault(activity.name, []).append(member)
+
+        if len(juegos_activos) < 2:
+            return await ctx.send("🔍 No hay suficientes juegos diferentes para separar (se necesitan al menos 2).")
+
+        category = voice_channel.category
+        created_channels = []
+        for juego, members in juegos_activos.items():
+            channel_name = f"🎮 {juego[:85]}"
+            new_channel = await ctx.guild.create_voice_channel(channel_name, category=category)
+            created_channels.append(new_channel)
+            for member in members:
+                try:
+                    await member.move_to(new_channel)
+                except Exception:
+                    logger.warning("No pude mover a %s al canal %s", getattr(member, "display_name", member), channel_name)
+
+        await ctx.send(f"✅ Separé a los jugadores en **{len(created_channels)}** canales por juego.")
+    except Exception:
+        logger.error("Error en comando separar:\n%s", traceback.format_exc())
+        await ctx.send("⚠️ No pude separar jugadores. Revisa mis permisos de mover miembros y crear canales.")
 
 
 # Comando para separar jugadores (slash command)
@@ -8607,6 +8734,9 @@ def _dj_channel_from_session(guild: discord.Guild) -> Optional[discord.TextChann
     origin = session.get("origin_channel")
 
     candidates = []
+    music_origin_id = music_origin_channels.get(guild.id) if 'music_origin_channels' in globals() else None
+    if music_origin_id:
+        candidates.append(guild.get_channel(music_origin_id) or bot.get_channel(music_origin_id))
     if isinstance(origin, discord.TextChannel):
         candidates.append(origin)
     elif isinstance(origin, int):
@@ -9114,7 +9244,7 @@ async def resolve_song(
 
 _FAST_MUSIC_CACHE: Dict[str, Dict[str, Union[float, Dict, str]]] = {}
 _FAST_CACHE_TTL = int(os.getenv("MUSIC_CACHE_TTL", "600"))
-_FAST_YTDLP_TIMEOUT = int(os.getenv("YTDLP_FAST_TIMEOUT", os.getenv("YTDLP_API_TIMEOUT", "9")))
+_FAST_YTDLP_TIMEOUT = int(os.getenv("YTDLP_FAST_TIMEOUT", os.getenv("YTDLP_API_TIMEOUT", "12")))
 _FAST_SEARCH_LIMIT = int(os.getenv("MUSIC_SEARCH_LIMIT", "5"))
 _FAST_TRY_NO_COOKIES = os.getenv("YTDLP_TRY_NO_COOKIES", "true").lower() in {"1", "true", "yes", "on"}
 _FAST_MAX_ATTEMPTS = int(os.getenv("MUSIC_MAX_ATTEMPTS", "4"))
@@ -9704,4 +9834,620 @@ async def resolve_song(
             msg = "No pude encontrar audio reproducible. Probé sin cookies, con cookies, clientes alternos y fallback tipo bot viejo."
         raise MusicSearchError(f"{msg}\nConsulta: `{query}`") from e
 
+
+# ================================================================
+# PARCHE DZKNIGHT FINAL: URL exacta + fallback real + búsqueda precisa
+# ================================================================
+# Este bloque se deja al final para sobrescribir lo anterior sin tocar módulos
+# de tickets, moderación, DJ ni comandos ya registrados.
+
+URL_TITLE_FALLBACK_ENABLED = os.getenv("URL_TITLE_FALLBACK_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+YTDLP_USE_LEGACY_FALLBACK = os.getenv("YTDLP_USE_LEGACY_FALLBACK", "true").lower() in {"1", "true", "yes", "on"}
+
+OFFICIAL_INDICATORS = [
+    "official", "oficial", "official audio", "official video", "official music video",
+    "video oficial", "audio oficial", "visualizer", "topic"
+]
+
+LOW_QUALITY_INDICATORS = [
+    "karaoke", "reaction", "tutorial", "type beat", "instrumental", "cover",
+    "slowed", "reverb", "sped up", "nightcore", "8d", "bass boosted",
+    "mashup", "remake", "edit", "tiktok", "tik tok"
+]
+
+
+def get_youtube_player_clients() -> List[str]:
+    """Clientes alternos de YouTube para yt-dlp en Render.
+
+    No todos los clientes devuelven formatos de audio en IPs cloud. Por eso
+    probamos una lista moderada, empezando por clientes que suelen entregar
+    audio sin depender tanto de cookies.
+    """
+    raw = os.getenv(
+        "YTDLP_YOUTUBE_CLIENTS",
+        "default,android_vr,android,ios,web_safari,web_embedded,mweb"
+    )
+    preferred = ["default", "android_vr", "android", "ios", "web_safari", "web_embedded", "mweb"]
+    clients: List[str] = []
+    for part in list(raw.split(",")) + preferred:
+        client = part.strip()
+        if client and client not in clients:
+            clients.append(client)
+    return clients or ["default", "android_vr", "android", "ios"]
+
+
+def get_youtube_extractor_args() -> Dict[str, Dict[str, List[str]]]:
+    """Extractor args para Python API de yt-dlp con clientes de respaldo."""
+    return {
+        "youtube": {
+            "player_client": get_youtube_player_clients(),
+            # Hace que yt-dlp no desperdicie tanto tiempo con la web normal
+            # cuando los clientes alternos pueden entregar formatos más rápido.
+            "player_skip": ["webpage"],
+        }
+    }
+
+
+def youtube_extractor_args_cli() -> str:
+    """Extractor args equivalente para CLI de yt-dlp."""
+    return "youtube:player_client=" + ",".join(get_youtube_player_clients()) + ";youtube:player_skip=webpage"
+
+
+def _extract_youtube_video_id(url: str) -> Optional[str]:
+    """Extrae el video_id de enlaces youtube/watch, youtu.be, shorts o embed."""
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip().strip("<>"))
+        host = parsed.netloc.lower().replace("www.", "")
+        path = parsed.path or ""
+        query = urllib.parse.parse_qs(parsed.query)
+        if "youtube.com" in host or "music.youtube.com" in host:
+            if query.get("v"):
+                return query.get("v", [""])[0] or None
+            if path.startswith("/shorts/"):
+                return path.split("/shorts/", 1)[1].split("/", 1)[0] or None
+            if path.startswith("/embed/"):
+                return path.split("/embed/", 1)[1].split("/", 1)[0] or None
+        if "youtu.be" in host:
+            return path.strip("/").split("/", 1)[0] or None
+    except Exception:
+        return None
+    return None
+
+
+def _pick_audio_url_from_info(info: Dict) -> Optional[str]:
+    """Saca una URL de audio evitando formatos sin audio/imagen.
+
+    El error real de Render era: yt-dlp devuelve entradas, pero ninguna con audio.
+    Esta versión revisa formatos con más cuidado y prioriza opus/m4a/webm.
+    """
+    if not isinstance(info, dict):
+        return None
+
+    direct = info.get("url")
+    direct_acodec = info.get("acodec")
+    direct_vcodec = info.get("vcodec")
+    if direct and direct_acodec not in (None, "none"):
+        return direct
+    # Algunos extractores no reportan acodec en el dict raíz, pero la URL es de audio.
+    if direct and not info.get("formats"):
+        if any(x in str(direct).lower() for x in ("googlevideo.com", "mime=audio", "audio", ".m4a", ".webm", ".opus")):
+            return direct
+
+    formats = info.get("formats") or []
+    valid: List[Dict] = []
+    for fmt in formats:
+        if not isinstance(fmt, dict) or not fmt.get("url"):
+            continue
+        acodec = fmt.get("acodec")
+        vcodec = fmt.get("vcodec")
+        ext = str(fmt.get("ext") or "").lower()
+        proto = str(fmt.get("protocol") or "").lower()
+        fmt_url = str(fmt.get("url") or "").lower()
+
+        if proto in {"mhtml", "images"} or ext in {"mhtml", "jpg", "png", "webp"}:
+            continue
+        if acodec in (None, "none"):
+            # Si no hay acodec explícito, solo lo dejamos pasar si la URL grita audio.
+            if "mime=audio" not in fmt_url and ext not in {"m4a", "webm", "opus", "mp3"}:
+                continue
+        valid.append(fmt)
+
+    if not valid:
+        return None
+
+    def fmt_score(fmt: Dict) -> int:
+        score = 0
+        ext = str(fmt.get("ext") or "").lower()
+        acodec = str(fmt.get("acodec") or "").lower()
+        vcodec = fmt.get("vcodec")
+        if vcodec in (None, "none"):
+            score += 50
+        if ext in {"opus", "m4a", "webm", "mp3"}:
+            score += {"opus": 40, "m4a": 35, "webm": 30, "mp3": 20}.get(ext, 0)
+        if "opus" in acodec:
+            score += 25
+        if "mp4a" in acodec or "aac" in acodec:
+            score += 20
+        try:
+            score += min(int(float(fmt.get("abr") or fmt.get("tbr") or 0)), 320) // 10
+        except Exception:
+            pass
+        return score
+
+    best = sorted(valid, key=fmt_score, reverse=True)[0]
+    return best.get("url")
+
+
+def _calculate_relevance_score(info: Dict, query: str, artist: Optional[str] = None, song: Optional[str] = None) -> int:
+    """Ranking más parecido a una búsqueda humana en YouTube."""
+    title = str(info.get("title") or "").lower()
+    uploader = str(info.get("uploader") or info.get("channel") or "").lower()
+    q = _strip_music_noise(query).lower()
+    haystack = f"{title} {uploader}"
+    q_tokens = _meaningful_music_tokens(query) if '_meaningful_music_tokens' in globals() else set(q.split())
+    score = 0
+
+    if q and title == q:
+        score += 120
+    elif q and q in title:
+        score += 90
+
+    matched = 0
+    for token in q_tokens:
+        if token in title:
+            score += 14
+            matched += 1
+        elif token in uploader:
+            score += 9
+            matched += 1
+        elif token in haystack:
+            score += 4
+
+    if q_tokens and matched >= max(1, len(q_tokens) - 1):
+        score += 35
+
+    if artist and artist.lower() in haystack:
+        score += 35
+    if song and song.lower() in title:
+        score += 45
+
+    for good in OFFICIAL_INDICATORS:
+        if good in haystack:
+            score += 12
+
+    q_lower = str(query or "").lower()
+    for bad in LOW_QUALITY_INDICATORS:
+        if bad in haystack and bad not in q_lower:
+            score -= 25
+    # Remix se penaliza, pero no se mata aquí porque el fallback relajado lo usa como último recurso.
+    if "remix" in haystack and "remix" not in q_lower:
+        score -= 18
+
+    duration = _safe_int(info.get("duration"), 0)
+    if 120 <= duration <= 360:
+        score += 15
+    elif 60 <= duration < 120:
+        score += 5
+    elif duration > 600:
+        score -= 30
+
+    views = _safe_int(info.get("view_count"), 0)
+    if views > 10_000_000:
+        score += 25
+    elif views > 1_000_000:
+        score += 18
+    elif views > 100_000:
+        score += 10
+
+    return score
+
+
+def _score_music_candidate(info: Dict, query: str) -> int:
+    return _calculate_relevance_score(info, query)
+
+
+async def _extract_youtube_audio_fallback(url: str):
+    """Último recurso de URL exacta: `yt-dlp -g`.
+
+    Esto no descarga nada. Solo pide la URL directa de audio. Es útil cuando la API
+    de Python devuelve metadata/entries pero ningún formato de audio usable.
+    """
+    raw = str(url or "").strip().strip("<>")
+    clean = _normalize_youtube_url_for_play(raw) if '_normalize_youtube_url_for_play' in globals() else raw
+    video_id = _extract_youtube_video_id(clean or raw)
+    if not video_id:
+        raise MusicSearchError("No pude extraer ID del video de YouTube.")
+
+    variants = _youtube_url_variants_for_play(raw) if '_youtube_url_variants_for_play' in globals() else [clean or raw]
+    cookiefile = get_cookiefile_path()
+    cookie_order = _attempt_cookie_order(is_url=True, is_soundcloud=False, cookiefile=cookiefile) if '_attempt_cookie_order' in globals() else ([True, False] if cookiefile else [False])
+    last_error: Optional[BaseException] = None
+
+    for variant in variants:
+        for use_cookies in cookie_order:
+            cmd = [
+                sys.executable, "-m", "yt_dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "--quiet",
+                "--no-cache-dir",
+                "--force-ipv4",
+                "--extractor-args", youtube_extractor_args_cli(),
+                "-f", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                "-g",
+            ]
+            deno_path = get_deno_runtime_path() if 'get_deno_runtime_path' in globals() else None
+            if deno_path:
+                cmd.extend(["--js-runtimes", f"deno:{deno_path}", "--remote-components", "ejs:github"])
+            if use_cookies and cookiefile:
+                cmd.extend(["--cookies", cookiefile])
+            cmd.append(variant)
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=int(os.getenv("YTDLP_URL_G_TIMEOUT", os.getenv("YTDLP_CLI_TIMEOUT", "15")))
+                )
+            except asyncio.TimeoutError as exc:
+                process.kill()
+                await process.communicate()
+                last_error = MusicSearchError("yt-dlp -g tardó demasiado.")
+                continue
+
+            out = stdout.decode("utf-8", errors="replace").strip()
+            err = stderr.decode("utf-8", errors="replace").strip()
+            if process.returncode != 0 and not out:
+                last_error = MusicSearchError((err or f"yt-dlp -g salió con código {process.returncode}")[:500])
+                continue
+
+            urls = [line.strip() for line in out.splitlines() if line.strip().startswith("http")]
+            audio_url = ""
+            for candidate in urls:
+                low = candidate.lower()
+                if "googlevideo.com" in low and ("mime=audio" in low or "audio" in low or "itag=140" in low or "itag=251" in low or "itag=250" in low or "itag=249" in low):
+                    audio_url = candidate
+                    break
+            if not audio_url and urls:
+                # Si solo hay una URL, FFmpeg decide. Preferible a morir sin probar.
+                audio_url = urls[0]
+
+            if audio_url:
+                title = None
+                try:
+                    title = await _fetch_youtube_title_from_oembed(clean or variant)
+                except Exception:
+                    title = None
+                info = {
+                    "id": video_id,
+                    "title": _title_to_music_search(title) if title and '_title_to_music_search' in globals() else (title or f"YouTube video {video_id}"),
+                    "webpage_url": clean or variant,
+                    "original_url": raw,
+                    "duration": 0,
+                    "thumbnail": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+                    "uploader": "YouTube",
+                    "channel": "YouTube",
+                    "_url_cli_g_fallback": True,
+                }
+                logger.info("URL exacta resuelta con yt-dlp -g (%s): %s", "cookies" if use_cookies else "sin cookies", video_id)
+                return info, audio_url
+
+    raise MusicSearchError(str(last_error or "yt-dlp -g no pudo obtener audio del enlace exacto."))
+
+
+async def _extract_music_from_title_fallback_safe(url: str):
+    """Fallback por título solo después de agotar el enlace exacto.
+
+    Sí busca por título, pero el título sale del MISMO enlace que el usuario pegó.
+    Por eso no se usa para reemplazar el enlace a lo loco; solo rescata cuando
+    YouTube/Render bloquea formatos del video exacto.
+    """
+    if not URL_TITLE_FALLBACK_ENABLED:
+        raise MusicSearchError("Fallback por título desactivado.")
+
+    title = await _fetch_youtube_title_from_oembed(url)
+    search_title = _title_to_music_search(title or "") if '_title_to_music_search' in globals() else str(title or "").strip()
+    search_title = _remove_trailing_music_punctuation(_clean_search_query(search_title)) if '_remove_trailing_music_punctuation' in globals() else search_title
+    if not search_title:
+        raise MusicSearchError("No pude obtener título alternativo del enlace.")
+
+    logger.info("URL exacta bloqueada; rescate por título del MISMO enlace: %s", search_title[:120])
+
+    attempts = [
+        f"ytsearch6:{search_title}",
+        f"ytsearch6:{search_title} official audio",
+        f"ytsearch6:{search_title} official video",
+        f"scsearch6:{search_title}",
+    ]
+    last_error = None
+    best: Optional[tuple] = None
+
+    for attempt in attempts:
+        try:
+            info, audio_url = await _extract_music_old_brutal(
+                attempt,
+                search_limit=6,
+                clean_query_for_filter=search_title,
+            )
+            score = _score_music_candidate(info, search_title)
+            if not best or score > best[0]:
+                best = (score, info, audio_url)
+            # Si es suficientemente bueno, lo usamos ya.
+            if score >= int(os.getenv("URL_TITLE_FALLBACK_MIN_SCORE", "18")):
+                info = dict(info)
+                info["_fallback_from_url_title"] = True
+                logger.info("URL resuelta por título del mismo enlace: %s", str(info.get("title") or search_title)[:110])
+                return info, audio_url
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Rescate por título falló '%s': %s", attempt[:100], str(exc)[:170])
+
+    if best:
+        score, info, audio_url = best
+        if score >= int(os.getenv("URL_TITLE_FALLBACK_MIN_SCORE_RELAXED", "10")):
+            info = dict(info)
+            info["_fallback_from_url_title"] = True
+            info["_relaxed_fallback"] = True
+            logger.warning("URL resuelta por título con fallback relajado: %s", str(info.get("title") or search_title)[:110])
+            return info, audio_url
+
+    raise MusicSearchError(str(last_error or "No hubo resultado por título con audio."))
+
+
+async def _extract_music_old_brutal(
+    query: str,
+    *,
+    search_limit: int = 1,
+    clean_query_for_filter: Optional[str] = None,
+):
+    """Extractor estilo viejo, pero con ranking y fallback relajado controlado."""
+    raw_query = str(query or "").strip()
+    if not raw_query:
+        raise MusicSearchError("Búsqueda vacía.")
+
+    cached = _get_fast_cached(raw_query) if '_get_fast_cached' in globals() else None
+    if cached:
+        return cached
+
+    is_url = bool(URL_REGEX.match(raw_query))
+    is_prefixed = bool(re.match(r"^(ytsearch|scsearch)\d*:", raw_query, re.IGNORECASE))
+    search_value = raw_query if (is_url or is_prefixed) else f"ytsearch{max(1, min(search_limit, 8))}:{raw_query}"
+    is_soundcloud = search_value.lower().startswith("scsearch") or "soundcloud.com" in search_value.lower()
+
+    cookiefile = get_cookiefile_path()
+    attempts = _attempt_cookie_order(is_url=is_url, is_soundcloud=is_soundcloud, cookiefile=cookiefile) if '_attempt_cookie_order' in globals() else ([True, False] if cookiefile else [False])
+
+    last_error = None
+    rejected: List[str] = []
+    relaxed_candidates: List[tuple] = []
+
+    for use_cookies in attempts:
+        opts = dict(ydl_opts)
+        opts.pop("cookiefile", None)
+        opts.update({
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "default_search": "ytsearch",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": True,
+            "ignore_no_formats_error": True,
+            "extract_flat": False,
+            "cachedir": False,
+            "logger": QuietYDLLogger(),
+            "extractor_args": get_youtube_extractor_args(),
+        })
+        if use_cookies and cookiefile:
+            opts["cookiefile"] = cookiefile
+
+        try:
+            with youtube_dl.YoutubeDL(opts) as ydl:
+                info = await asyncio.wait_for(
+                    extract_info_async(ydl, search_value, download=False),
+                    timeout=int(os.getenv("YTDLP_FAST_TIMEOUT", str(_FAST_YTDLP_TIMEOUT if '_FAST_YTDLP_TIMEOUT' in globals() else 12))),
+                )
+
+            entries = _normalize_yt_dlp_dump(info)
+            if not entries:
+                raise MusicSearchError("yt-dlp no devolvió entradas.")
+
+            if clean_query_for_filter and not is_url:
+                entries = sorted(entries, key=lambda e: _score_music_candidate(e, clean_query_for_filter), reverse=True)
+
+            for entry in entries:
+                audio_url = _pick_audio_url_from_info(entry)
+                if not audio_url:
+                    continue
+
+                if clean_query_for_filter and not is_url:
+                    reason = _candidate_reject_reason(entry, clean_query_for_filter)
+                    if reason:
+                        rejected.append(reason[:140])
+                        if '_relaxed_version_candidate_allowed' in globals() and _relaxed_version_candidate_allowed(entry, clean_query_for_filter):
+                            relaxed_candidates.append((_relaxed_score(entry, clean_query_for_filter) if '_relaxed_score' in globals() else _score_music_candidate(entry, clean_query_for_filter), entry, audio_url, reason))
+                        continue
+
+                logger.info(
+                    "Extractor final resolvió (%s): %s",
+                    "cookies" if use_cookies else "sin cookies",
+                    str(entry.get("title") or raw_query)[:110],
+                )
+                if '_set_fast_cached' in globals():
+                    _set_fast_cached(raw_query, entry, audio_url)
+                return entry, audio_url
+
+            if relaxed_candidates:
+                relaxed_candidates.sort(key=lambda x: x[0], reverse=True)
+                _, best_entry, best_audio, best_reason = relaxed_candidates[0]
+                best_entry = dict(best_entry)
+                best_entry["_relaxed_fallback"] = True
+                best_entry["_relaxed_reason"] = str(best_reason)
+                logger.warning("Fallback relajado activado para '%s': %s", raw_query[:90], str(best_entry.get("title") or raw_query)[:110])
+                if '_set_fast_cached' in globals():
+                    _set_fast_cached(raw_query, best_entry, best_audio)
+                return best_entry, best_audio
+
+            if rejected:
+                raise MusicSearchError("Candidatos rechazados: " + " | ".join(rejected[:3]))
+            raise MusicSearchError("yt-dlp devolvió entradas, pero ninguna con audio.")
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Extractor final falló para '%s' (%s): %s",
+                raw_query[:110],
+                "cookies" if use_cookies else "sin cookies",
+                str(exc)[:180],
+            )
+
+    raise MusicSearchError(str(last_error or "Extractor final no pudo resolver audio."))
+
+
+def build_music_searches(busqueda: str) -> List[str]:
+    """Búsquedas rápidas y precisas sin matar resultados con negativos largos."""
+    query = _remove_trailing_music_punctuation(_clean_search_query(busqueda))
+    if not query:
+        return []
+    if _query_is_direct_url(query):
+        return [query]
+
+    n = max(3, min(int(os.getenv("MUSIC_SEARCH_LIMIT", str(_FAST_SEARCH_LIMIT if '_FAST_SEARCH_LIMIT' in globals() else 5))), 8))
+    variants = _query_variants_for_text(query) if '_query_variants_for_text' in globals() else [query]
+    searches: List[str] = []
+
+    for variant in variants:
+        searches.append(f"ytsearch{n}:{variant}")
+        searches.append(f"ytsearch{n}:\"{variant}\"")
+        searches.append(f"ytsearch{n}:{variant} official audio")
+
+    # SoundCloud al final, porque para canciones raras a veces solo trae remixes.
+    for variant in variants[:2]:
+        searches.append(f"scsearch{max(3, min(n, 6))}:{variant}")
+
+    max_attempts = max(3, int(os.getenv("MUSIC_MAX_ATTEMPTS", str(_FAST_MAX_ATTEMPTS if '_FAST_MAX_ATTEMPTS' in globals() else 5))))
+    unique, seen = [], set()
+    for item in searches:
+        key = item.lower()
+        if key not in seen:
+            unique.append(item)
+            seen.add(key)
+        if len(unique) >= max_attempts:
+            break
+    return unique
+
+
+async def extract_music_legacy_like_bot18(query: str):
+    """Extractor final: URL exacta primero, luego `yt-dlp -g`, luego rescate por título opcional."""
+    raw_query = str(query or "").strip().strip("<>")
+    clean_query = _remove_trailing_music_punctuation(_clean_search_query(raw_query))
+
+    if _query_is_direct_url(raw_query) or _query_is_direct_url(clean_query):
+        last_error: Optional[BaseException] = None
+        url_to_use = raw_query or clean_query
+
+        # 1) Método normal/viejo con variantes del MISMO video.
+        for variant in _youtube_url_variants_for_play(url_to_use):
+            try:
+                return await _extract_music_old_brutal(variant, search_limit=1)
+            except Exception as exc:
+                last_error = exc
+                logger.warning("URL directa falló con extractor normal '%s': %s", variant[:120], str(exc)[:180])
+
+        # 2) Último recurso exacto: yt-dlp -g.
+        if YTDLP_USE_LEGACY_FALLBACK:
+            for variant in _youtube_url_variants_for_play(url_to_use):
+                try:
+                    return await _extract_youtube_audio_fallback(variant)
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning("URL directa falló con yt-dlp -g '%s': %s", variant[:120], str(exc)[:180])
+
+        # 3) Rescate por título del MISMO link, solo después de agotar exacto.
+        if "youtube" in url_to_use.lower() or "youtu.be" in url_to_use.lower():
+            try:
+                return await _extract_music_from_title_fallback_safe(url_to_use)
+            except Exception as exc:
+                logger.warning("URL directa falló también por título del mismo enlace: %s", str(exc)[:180])
+                raise MusicSearchError(str(last_error or exc or "No pude resolver esa URL.")) from exc
+
+        raise MusicSearchError(str(last_error or "No pude resolver esa URL exacta."))
+
+    # Texto: búsqueda por candidatos, como el viejo, pero con ranking/control.
+    last_error: Optional[BaseException] = None
+    for attempt in build_music_searches(clean_query):
+        try:
+            return await _extract_music_old_brutal(
+                attempt,
+                search_limit=int(os.getenv("MUSIC_SEARCH_LIMIT", str(_FAST_SEARCH_LIMIT if '_FAST_SEARCH_LIMIT' in globals() else 5))),
+                clean_query_for_filter=clean_query,
+            )
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Búsqueda final falló '%s': %s", attempt[:120], str(exc)[:180])
+
+    logger.warning("Búsqueda final no resolvió '%s'; pruebo CLI/EJS: %s", clean_query, str(last_error)[:180])
+    info, audio_url = await extract_music_with_cli_ejs(clean_query)
+    reason = _candidate_reject_reason(info, clean_query)
+    if reason:
+        raise MusicSearchError(reason)
+    return info, audio_url
+
+
+async def resolve_song(
+    busqueda: str,
+    requested_by,
+    *,
+    max_duration: Optional[int] = None,
+    exclude_markers: Optional[Set[str]] = None,
+) -> Dict:
+    """Resolve final: exacto para URL, preciso para texto y menos dramático en Render."""
+    original_query = str(busqueda or "").strip()
+    query = _remove_trailing_music_punctuation(_clean_search_query(original_query))
+    if not query:
+        raise MusicSearchError("Escribe el nombre o enlace de una canción.")
+
+    direct_requested = _query_is_direct_url(original_query) or _query_is_direct_url(query)
+    exclude_markers = set(exclude_markers or set())
+
+    try:
+        info, audio_url = await extract_music_legacy_like_bot18(original_query)
+        duration = _safe_int(info.get("duration"), 0)
+        if max_duration and duration and duration > max_duration:
+            raise MusicSearchError("La canción supera la duración máxima permitida.")
+
+        relaxed_used = bool(isinstance(info, dict) and (info.get("_relaxed_fallback") or info.get("_fallback_from_url_title") or info.get("_url_cli_g_fallback")))
+        if not direct_requested and not relaxed_used:
+            reason = _candidate_reject_reason(info, query)
+            if reason:
+                raise MusicSearchError(reason)
+
+        song = {
+            "title": str(info.get("title") or query)[:100],
+            "url": audio_url,
+            "web_url": info.get("webpage_url") or info.get("original_url") or query,
+            "duration": duration,
+            "requested_by": requested_by,
+            "thumbnail": info.get("thumbnail") or "https://i.imgur.com/8Km9tLL.png",
+            "uploader": str(info.get("uploader") or info.get("channel") or "Artista desconocido")[:80],
+        }
+        if exclude_markers and (song_markers(song) & exclude_markers):
+            raise MusicSearchError("La canción ya está sonando, en cola o fue usada recientemente.")
+        if relaxed_used:
+            logger.warning("⚠️ Canción resuelta con fallback final: %s", song["title"])
+        else:
+            logger.info("✅ Canción resuelta: %s", song["title"])
+        return song
+    except Exception as e:
+        logger.warning("Resolve final falló para '%s': %s", query[:120], str(e)[:240])
+        if direct_requested:
+            msg = "No pude abrir ese enlace exacto de YouTube en Render. Probé URL limpia, variantes, yt-dlp -g y rescate por título del mismo enlace."
+        else:
+            msg = "No pude encontrar audio reproducible. Probé sin cookies, con cookies, clientes alternos, ranking y fallback tipo bot viejo."
+        raise MusicSearchError(f"{msg}\nConsulta: `{query}`") from e
+
+
 bot.run(TOKEN)
+
