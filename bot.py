@@ -10449,5 +10449,148 @@ async def resolve_song(
         raise MusicSearchError(f"{msg}\nConsulta: `{query}`") from e
 
 
-bot.run(TOKEN)
 
+
+# ================================================================
+# PATCH DZKnight: ajustes finales DeepSeek + criterio propio
+# ================================================================
+# Este bloque se deja al final para sobreescribir funciones anteriores sin tocar
+# el resto del bot. Así evitamos el Frankenstein.py de copiar/pegar por partes.
+
+def youtube_extractor_args_cli() -> str:
+    """Extractor args CLI correcto para yt-dlp.
+
+    yt-dlp espera: youtube:arg1=...;arg2=...
+    No: youtube:arg1=...;youtube:arg2=...
+    """
+    return "youtube:player_client=" + ",".join(get_youtube_player_clients()) + ";player_skip=webpage"
+
+
+async def _extract_youtube_direct_url_fallback(url: str):
+    """Alias claro para el fallback directo de URLs.
+
+    Mantiene compatibilidad con las sugerencias externas y usa la implementación
+    robusta ya integrada: yt-dlp -g + cookies opcionales + Deno/EJS + clientes alternos.
+    """
+    return await _extract_youtube_audio_fallback(url)
+
+
+async def extract_music_legacy_like_bot18(query: str):
+    """Extractor final: link exacto primero con yt-dlp -g, luego método viejo.
+
+    Para URL:
+    1) yt-dlp -g sobre el MISMO enlace/variantes del mismo video.
+    2) extractor viejo/bruto sobre el MISMO enlace.
+    3) fallback por título del MISMO enlace si está activado.
+
+    Para texto:
+    Mantiene ranking/control y fallback tipo bot viejo.
+    """
+    raw_query = str(query or "").strip().strip("<>")
+    clean_query = _remove_trailing_music_punctuation(_clean_search_query(raw_query))
+
+    if _query_is_direct_url(raw_query) or _query_is_direct_url(clean_query):
+        last_error: Optional[BaseException] = None
+        url_to_use = raw_query or clean_query
+
+        variants = _youtube_url_variants_for_play(url_to_use)
+
+        # 1) Método directo primero. Evita que yt-dlp se quede en metadata sin audio.
+        if YTDLP_USE_LEGACY_FALLBACK:
+            for variant in variants:
+                try:
+                    return await _extract_youtube_direct_url_fallback(variant)
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning("URL directa falló con yt-dlp -g primero '%s': %s", variant[:120], str(exc)[:180])
+
+        # 2) Método viejo/bruto con variantes del MISMO video.
+        for variant in variants:
+            try:
+                return await _extract_music_old_brutal(variant, search_limit=1)
+            except Exception as exc:
+                last_error = exc
+                logger.warning("URL directa falló con extractor normal '%s': %s", variant[:120], str(exc)[:180])
+
+        # 3) Reintento -g al final por si el extractor viejo refrescó algo/cacheó algo.
+        if YTDLP_USE_LEGACY_FALLBACK:
+            for variant in variants:
+                try:
+                    return await _extract_youtube_audio_fallback(variant)
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning("URL directa falló con yt-dlp -g final '%s': %s", variant[:120], str(exc)[:180])
+
+        # 4) Rescate por título del MISMO link, nunca búsqueda random.
+        if "youtube" in url_to_use.lower() or "youtu.be" in url_to_use.lower():
+            try:
+                return await _extract_music_from_title_fallback_safe(url_to_use)
+            except Exception as exc:
+                logger.warning("URL directa falló también por título del mismo enlace: %s", str(exc)[:180])
+                raise MusicSearchError(str(last_error or exc or "No pude resolver esa URL.")) from exc
+
+        raise MusicSearchError(str(last_error or "No pude resolver esa URL exacta."))
+
+    # Texto: búsqueda por candidatos, como el viejo, pero con ranking/control.
+    last_error: Optional[BaseException] = None
+    for attempt in build_music_searches(clean_query):
+        try:
+            return await _extract_music_old_brutal(
+                attempt,
+                search_limit=int(os.getenv("MUSIC_SEARCH_LIMIT", str(_FAST_SEARCH_LIMIT if '_FAST_SEARCH_LIMIT' in globals() else 5))),
+                clean_query_for_filter=clean_query,
+            )
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Búsqueda final falló '%s': %s", attempt[:120], str(exc)[:180])
+
+    logger.warning("Búsqueda final no resolvió '%s'; pruebo CLI/EJS: %s", clean_query, str(last_error)[:180])
+    info, audio_url = await extract_music_with_cli_ejs(clean_query)
+    reason = _candidate_reject_reason(info, clean_query)
+    if reason:
+        raise MusicSearchError(reason)
+    return info, audio_url
+
+
+# Asegura que los parches DJ que usan la versión base no queden en None.
+try:
+    _resolve_song_base_for_dj = resolve_song
+except NameError:
+    _resolve_song_base_for_dj = None
+
+
+def _apply_command_cooldowns() -> None:
+    """Cooldowns suaves para comandos pesados.
+
+    No bloquea el bot completo: solo evita que un usuario dispare muchas búsquedas
+    pesadas seguidas y Render/YouTube empiecen a ponerse exquisitos.
+    """
+    cooldowns = {
+        "play": (1, int(os.getenv("PLAY_COOLDOWN_SECONDS", "4"))),
+        "dj": (1, int(os.getenv("DJ_COOLDOWN_SECONDS", "10"))),
+        "radio": (1, int(os.getenv("DJ_COOLDOWN_SECONDS", "10"))),
+        "mix": (1, int(os.getenv("DJ_COOLDOWN_SECONDS", "10"))),
+        "separar": (1, int(os.getenv("SEPARAR_COOLDOWN_SECONDS", "10"))),
+    }
+
+    applied = set()
+    for command_name, (rate, per) in cooldowns.items():
+        command = bot.get_command(command_name)
+        if not command or id(command) in applied:
+            continue
+        try:
+            command._buckets = commands.CooldownMapping.from_cooldown(
+                rate,
+                max(1, per),
+                commands.BucketType.user,
+            )
+            applied.add(id(command))
+            logger.info("Cooldown aplicado a comando '%s': %s uso(s) cada %ss por usuario", command_name, rate, per)
+        except Exception as exc:
+            logger.warning("No pude aplicar cooldown a '%s': %s", command_name, exc)
+
+
+_apply_command_cooldowns()
+
+
+bot.run(TOKEN)
