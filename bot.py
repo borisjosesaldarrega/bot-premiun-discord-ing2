@@ -152,20 +152,34 @@ ydl_opts = {
 }
 
 def get_youtube_player_clients() -> List[str]:
-    """Clientes alternos de YouTube como en el código nuevo, sin buscar más resultados."""
-    raw = os.getenv("YTDLP_YOUTUBE_CLIENTS", "default,android_vr,android,ios,web_safari")
+    """Clientes alternos de YouTube.
+
+    Mantiene el estilo bruto: mismo query, primer resultado.
+    Estos clientes solo se usan para intentar extraer audio del MISMO video.
+    """
+    raw = os.getenv(
+        "YTDLP_YOUTUBE_CLIENTS",
+        "default,android_vr,android,ios,web_safari,web_embedded,mweb"
+    )
     clients: List[str] = []
     for part in raw.split(","):
         client = part.strip()
         if client and client not in clients:
             clients.append(client)
-    return clients or ["default", "android_vr"]
+    return clients or ["default", "android_vr", "android", "ios"]
 
 
-def get_youtube_extractor_args() -> Dict[str, Dict[str, List[str]]]:
+def get_youtube_extractor_args(player_client: Optional[Union[str, List[str]]] = None) -> Dict[str, Dict[str, List[str]]]:
+    if player_client is None:
+        clients = get_youtube_player_clients()
+    elif isinstance(player_client, str):
+        clients = [player_client]
+    else:
+        clients = list(player_client)
+
     return {
         "youtube": {
-            "player_client": get_youtube_player_clients(),
+            "player_client": clients,
         }
     }
 
@@ -292,15 +306,26 @@ def get_cookiefile_path() -> Optional[str]:
     return None
 
 
-def _build_ytdlp_opts(use_cookies: bool = True) -> Dict:
+def _build_ytdlp_opts(
+    use_cookies: bool = True,
+    player_client: Optional[Union[str, List[str]]] = None,
+    allow_incomplete: bool = True
+) -> Dict:
     """Opciones de yt-dlp manteniendo el flujo viejo: una búsqueda y primer resultado."""
     opts = dict(ydl_opts)
     opts.pop("cookiefile", None)
 
-    # Igual que el código nuevo: ayuda con YouTube en hosting cloud.
+    # Ayuda con YouTube en hosting cloud.
     if "get_youtube_extractor_args" in globals():
-        opts["extractor_args"] = get_youtube_extractor_args()
-    opts["ignore_no_formats_error"] = True
+        opts["extractor_args"] = get_youtube_extractor_args(player_client)
+
+    # Si queda metadata sin audio, queremos recibirla para reintentar el MISMO video.
+    opts["ignore_no_formats_error"] = allow_incomplete
+
+    # Evita playlists raras y fuerza IPv4, suele ser más estable en Render.
+    opts["noplaylist"] = True
+    opts["force_ipv4"] = True
+    opts["cachedir"] = False
 
     if use_cookies:
         cookiefile = get_cookiefile_path()
@@ -366,23 +391,92 @@ def _audio_url_from_info(info: Dict) -> Optional[str]:
     return None
 
 
+def _same_video_urls_from_info(info: Dict) -> List[str]:
+    """Saca URLs del MISMO video para reintentar extracción directa, sin otra búsqueda."""
+    urls: List[str] = []
+    if not isinstance(info, dict):
+        return urls
+
+    for key in ("webpage_url", "original_url", "url"):
+        value = info.get(key)
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            if value not in urls:
+                urls.append(value)
+
+    video_id = info.get("id")
+    extractor = str(info.get("extractor_key") or info.get("extractor") or "").lower()
+    if video_id and ("youtube" in extractor or len(str(video_id)) == 11):
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        short_url = f"https://youtu.be/{video_id}"
+        if watch_url not in urls:
+            urls.append(watch_url)
+        if short_url not in urls:
+            urls.append(short_url)
+
+    return urls
+
+
+async def _extract_same_video_with_client(video_url: str, use_cookies: bool, player_client: str) -> Optional[Dict]:
+    """Reintenta extracción directa del MISMO video con un cliente específico."""
+    opts = _build_ytdlp_opts(
+        use_cookies=use_cookies,
+        player_client=player_client,
+        allow_incomplete=True
+    )
+
+    try:
+        if opts.get("cookiefile"):
+            logger.info("yt-dlp reintento mismo video con cookies/client=%s", player_client)
+        else:
+            logger.info("yt-dlp reintento mismo video sin cookies/client=%s", player_client)
+
+        with youtube_dl.YoutubeDL(opts) as ydl:
+            raw_info = await extract_info_async(ydl, video_url, download=False)
+
+        info = _first_ytdlp_result(raw_info)
+        if info and _audio_url_from_info(info):
+            return info
+
+        title = info.get("title", "sin título") if isinstance(info, dict) else "sin info"
+        formats_count = len(info.get("formats") or []) if isinstance(info, dict) else 0
+        logger.warning(
+            "Reintento sin audio client=%s cookies=%s título=%s formats=%s",
+            player_client,
+            use_cookies,
+            str(title)[:90],
+            formats_count,
+        )
+    except Exception as e:
+        logger.warning(
+            "Reintento falló client=%s cookies=%s url=%s error=%s",
+            player_client,
+            use_cookies,
+            video_url[:90],
+            str(e)[:180],
+        )
+
+    return None
+
+
 async def extract_brute_ytdlp_info(search_query: str) -> Dict:
     """Mismo query y primer resultado.
 
-    Si YouTube devuelve metadata sin audio, intenta el MISMO query una vez sin cookies.
-    No usa búsquedas múltiples ni cambia a otro resultado.
+    Si YouTube devuelve metadata sin audio, reintenta extracción directa del MISMO video
+    con clientes alternos. No usa búsquedas múltiples, no prueba otra canción y no cambia resultado.
     """
     attempts = []
     opts_with_cookie = _build_ytdlp_opts(use_cookies=True)
 
     if opts_with_cookie.get("cookiefile"):
-        attempts.append(("con cookies", opts_with_cookie))
+        attempts.append(("con cookies", True, opts_with_cookie))
     else:
         logger.warning("No encontré cookies válidas para yt-dlp. YouTube puede bloquear Render.")
 
-    attempts.append(("sin cookies", _build_ytdlp_opts(use_cookies=False)))
+    attempts.append(("sin cookies", False, _build_ytdlp_opts(use_cookies=False)))
 
-    for label, opts in attempts:
+    metadata_without_audio: Optional[Dict] = None
+
+    for label, use_cookies, opts in attempts:
         try:
             cookie_used = opts.get("cookiefile")
             if cookie_used:
@@ -395,20 +489,57 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
             if info and _audio_url_from_info(info):
                 return info
 
+            if info:
+                metadata_without_audio = info
+
             title = info.get("title", "sin título") if isinstance(info, dict) else "sin info"
             keys = list(info.keys())[:12] if isinstance(info, dict) else []
+            formats_count = len(info.get("formats") or []) if isinstance(info, dict) else 0
             logger.warning(
-                "yt-dlp obtuvo metadata pero sin audio (%s). Título=%s | keys=%s",
+                "yt-dlp obtuvo metadata pero sin audio (%s). Título=%s | formats=%s | keys=%s",
                 label,
                 str(title)[:120],
+                formats_count,
                 keys,
             )
+
+            # Fallback rápido: mismo video, clientes alternos, sin buscar otro resultado.
+            if info:
+                same_video_urls = _same_video_urls_from_info(info)
+
+                # Fallback limitado para no volver lento el comando:
+                # mismo video, pocos clientes, nada de buscar otra canción.
+                preferred_clients = ["android_vr", "android", "ios", "web_safari", "default"]
+                configured_clients = get_youtube_player_clients()
+                clients = [c for c in preferred_clients if c in configured_clients]
+                for c in configured_clients:
+                    if c not in clients and len(clients) < 4:
+                        clients.append(c)
+                clients = clients[:4]
+
+                for video_url in same_video_urls[:2]:
+                    for client in clients:
+                        fixed = await _extract_same_video_with_client(
+                            video_url,
+                            use_cookies=use_cookies,
+                            player_client=client,
+                        )
+                        if fixed and _audio_url_from_info(fixed):
+                            return fixed
+
         except Exception as e:
             logger.warning("yt-dlp falló %s para '%s': %s", label, search_query, str(e)[:180])
 
+    if metadata_without_audio:
+        title = metadata_without_audio.get("title") or "la canción"
+        raise Exception(
+            f"YouTube encontró **{str(title)[:80]}**, pero no entregó audio reproducible. "
+            "Reexporta cookies.txt desde una sesión activa de YouTube o prueba una URL directa."
+        )
+
     raise Exception(
-        "YouTube devolvió la canción pero sin enlace de audio reproducible. "
-        "Prueba reexportar cookies.txt o usar otra URL/canción."
+        "YouTube no devolvió audio reproducible. "
+        "Reexporta cookies.txt desde una sesión activa de YouTube o prueba una URL directa."
     )
 
 
