@@ -151,6 +151,110 @@ ydl_opts = {
     'no-cache-dir': True
 }
 
+def _build_ytdlp_opts(use_cookies: bool = True) -> Dict:
+    """Opciones de yt-dlp manteniendo el flujo viejo: una búsqueda y primer resultado."""
+    opts = dict(ydl_opts)
+    default_cookie = opts.pop("cookiefile", None)
+
+    if use_cookies:
+        candidates = [
+            os.getenv("YTDLP_COOKIES_FILE"),
+            os.getenv("COOKIES_FILE"),
+            "/etc/secrets/cookies.txt",
+            default_cookie,
+        ]
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                try:
+                    if os.path.getsize(candidate) > 0:
+                        opts["cookiefile"] = candidate
+                        break
+                except Exception:
+                    pass
+
+    return opts
+
+
+def _first_ytdlp_result(info):
+    """Devuelve solo el primer resultado, como el viejo, pero sin romper si viene None."""
+    if not isinstance(info, dict):
+        return None
+
+    if "entries" in info:
+        entries = info.get("entries") or []
+        if not entries:
+            return None
+        first = entries[0]
+        return first if isinstance(first, dict) else None
+
+    return info
+
+
+def _audio_url_from_info(info: Dict) -> Optional[str]:
+    """Saca la URL de audio del mismo resultado; no busca canciones extra."""
+    if not isinstance(info, dict):
+        return None
+
+    if info.get("url"):
+        return info.get("url")
+
+    formats = info.get("formats") or []
+
+    for fmt in formats:
+        if (
+            isinstance(fmt, dict)
+            and fmt.get("url")
+            and fmt.get("acodec") not in (None, "none")
+            and fmt.get("vcodec") in (None, "none")
+        ):
+            return fmt.get("url")
+
+    for fmt in formats:
+        if isinstance(fmt, dict) and fmt.get("url") and fmt.get("acodec") not in (None, "none"):
+            return fmt.get("url")
+
+    for fmt in formats:
+        if isinstance(fmt, dict) and fmt.get("url"):
+            return fmt.get("url")
+
+    return None
+
+
+async def extract_brute_ytdlp_info(search_query: str) -> Dict:
+    """Mismo query y primer resultado.
+
+    Si hay cookies configuradas las prueba primero. Si YouTube devuelve None por cookie mala
+    o bloqueo, intenta el MISMO query una vez sin cookies. No usa búsquedas múltiples ni candidatos.
+    """
+    attempts = []
+    opts_with_cookie = _build_ytdlp_opts(use_cookies=True)
+
+    if opts_with_cookie.get("cookiefile"):
+        attempts.append(("con cookies", opts_with_cookie))
+
+    attempts.append(("sin cookies", _build_ytdlp_opts(use_cookies=False)))
+
+    last_error = None
+
+    for label, opts in attempts:
+        try:
+            with youtube_dl.YoutubeDL(opts) as ydl:
+                raw_info = await extract_info_async(ydl, search_query, download=False)
+
+            info = _first_ytdlp_result(raw_info)
+            if info:
+                return info
+
+            last_error = Exception(f"YouTube devolvió resultado vacío ({label}).")
+        except Exception as e:
+            last_error = e
+            logger.warning("yt-dlp falló %s para '%s': %s", label, search_query, str(e)[:180])
+
+    raise Exception(
+        "YouTube bloqueó ese resultado o no devolvió audio. "
+        "Mantengo la búsqueda rápida; si sigue pasando, actualiza cookies.txt en Render."
+    )
+
 # --------------------------
 # Funciones auxiliares
 # --------------------------
@@ -587,37 +691,12 @@ async def play(ctx: commands.Context, *, busqueda: str) -> None:
     voice_client = ctx.voice_client or await safe_connect(ctx.author.voice.channel)
 
     try:
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            # CORRECCIÓN PRINCIPAL: Manejar correctamente la búsqueda
-            search_query = busqueda if is_url else f"ytsearch:{busqueda}"
-            info = await extract_info_async(ydl, search_query, download=False)
-            
-            # Verificar si info es None o no tiene la estructura esperada
-            if info is None:
-                raise Exception("No se encontraron resultados para tu búsqueda.")
+        search_query = busqueda if is_url else f"ytsearch:{busqueda}"
+        info = await extract_brute_ytdlp_info(search_query)
+        url2 = _audio_url_from_info(info)
 
-            # Manejar resultados de búsqueda (ytsearch devuelve un dict con 'entries')
-            if 'entries' in info:
-                if not info['entries']:
-                    raise Exception("No se encontraron resultados para tu búsqueda.")
-                info = info['entries'][0]
-            
-            # Verificar que info tenga la estructura mínima necesaria
-            if info is None or not isinstance(info, dict):
-                raise Exception("Formato de respuesta inválido desde YouTube.")
-
-            # Obtener la URL del audio de manera segura
-            if 'url' in info and info['url']:
-                url2 = info['url']
-            elif 'formats' in info and info['formats']:
-                # Buscar el mejor formato de audio
-                format_audio = next(
-                    (f for f in info['formats'] if f.get('acodec') != 'none' and f.get('vcodec') == 'none'),
-                    next((f for f in info['formats'] if f.get('acodec') != 'none'), info['formats'][0])
-                )
-                url2 = format_audio['url']
-            else:
-                raise Exception("No se pudo obtener la URL del audio.")
+        if not url2:
+            raise Exception("No se pudo obtener la URL del audio.")
 
             # Construir el objeto de la canción
             song = {
@@ -873,23 +952,13 @@ async def playtop(ctx: commands.Context, *, busqueda: str) -> None:
 
     with youtube_dl.YoutubeDL(ydl_opts) as ydl:
         try:
-            info = ydl.extract_info(
-                busqueda if is_url else f"ytsearch:{busqueda}",
-                download=False
+            info = await extract_brute_ytdlp_info(
+                busqueda if is_url else f"ytsearch:{busqueda}"
             )
+            url2 = _audio_url_from_info(info)
 
-            if 'entries' in info:
-                info = info['entries'][0]
-
-            if 'url' in info:
-                url2 = info['url']
-            else:
-                format = next(
-                    (f for f in info['formats']
-                     if f.get('acodec') != 'none'),
-                    info['formats'][0]
-                )
-                url2 = format['url']
+            if not url2:
+                raise Exception("No se pudo obtener la URL del audio.")
 
             song = {
                 "title": info.get("title") or busqueda,
@@ -2709,23 +2778,13 @@ async def play_slash(interaction: discord.Interaction, busqueda: str):
 
         # Extraer información del audio
         try:
-            with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-                info = await extract_info_async(
-                    ydl,
-                    busqueda if URL_REGEX.match(busqueda) else f"ytsearch:{busqueda}",
-                    download=False
-                )
-
-            if 'entries' in info:
-                info = info['entries'][0]
-
-            # Obtener el mejor formato de audio
-            format = next(
-                (f for f in info['formats']
-                 if f.get('acodec') != 'none' and f.get('vcodec') == 'none'),
-                info['formats'][0]
+            info = await extract_brute_ytdlp_info(
+                busqueda if URL_REGEX.match(busqueda) else f"ytsearch:{busqueda}"
             )
-            audio_url = format['url']
+            audio_url = _audio_url_from_info(info)
+
+            if not audio_url:
+                raise Exception("No se pudo obtener la URL del audio.")
 
             # Crear objeto canción con metadatos
             song = {
@@ -3016,23 +3075,13 @@ async def playtop_slash(ctx: discord.Interaction, *, busqueda: str):
 
     with youtube_dl.YoutubeDL(ydl_opts) as ydl:
         try:
-            info = ydl.extract_info(
-                busqueda if is_url else f"ytsearch:{busqueda}",
-                download=False
+            info = await extract_brute_ytdlp_info(
+                busqueda if is_url else f"ytsearch:{busqueda}"
             )
+            url2 = _audio_url_from_info(info)
 
-            if 'entries' in info:
-                info = info['entries'][0]
-
-            if 'url' in info:
-                url2 = info['url']
-            else:
-                format = next(
-                    (f for f in info['formats']
-                     if f.get('acodec') != 'none'),
-                    info['formats'][0]
-                )
-                url2 = format['url']
+            if not url2:
+                raise Exception("No se pudo obtener la URL del audio.")
 
             song = {
                 'title': info.get('title', busqueda),
@@ -4898,11 +4947,12 @@ async def karaoke_entrar(ctx: commands.Context, *, cancion: str):
     msg = await ctx.send("🔍 Buscando tu canción para karaoke...")
     try:
         is_url = bool(URL_REGEX.match(cancion))
-        with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            info = await extract_info_async(ydl, cancion if is_url else f"ytsearch:{cancion}", download=False)
-        if 'entries' in info:
-            info = info['entries'][0]
-        url2 = info.get('url') or next((f for f in info['formats'] if f.get('acodec') != 'none'), info['formats'][0])['url']
+        info = await extract_brute_ytdlp_info(cancion if is_url else f"ytsearch:{cancion}")
+        url2 = _audio_url_from_info(info)
+
+        if not url2:
+            raise Exception("No se pudo obtener la URL del audio.")
+
         entry = {"member_id": ctx.author.id, "name": ctx.author.display_name, "song_title": info.get("title") or cancion, "url": url2, "web_url": info.get("webpage_url") or cancion, "score": None}
         session["queue"].append(entry)
         await msg.edit(content=f"✅ {ctx.author.mention} apuntado con **{entry['song_title']}**")
