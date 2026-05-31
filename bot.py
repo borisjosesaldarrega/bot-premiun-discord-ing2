@@ -151,26 +151,128 @@ ydl_opts = {
     'no-cache-dir': True
 }
 
+_COOKIE_RUNTIME_CACHE: Dict[str, Dict[str, Union[str, float, int]]] = {}
+
+
+def _cookiefile_has_youtube_cookie(cookie_path: str) -> bool:
+    """Valida rápido que el archivo de cookies sí tenga cookies de YouTube."""
+    try:
+        if not cookie_path or not os.path.exists(cookie_path):
+            return False
+        if os.path.getsize(cookie_path) < 50:
+            return False
+        with open(cookie_path, "r", encoding="utf-8", errors="ignore") as f:
+            sample = f.read(250_000).lower()
+        return ("youtube.com" in sample or ".youtube.com" in sample or "googlevideo.com" in sample)
+    except Exception:
+        return False
+
+
+def _writable_cookiefile_copy(cookie_path: str) -> Optional[str]:
+    """Copia cookies a /tmp para que yt-dlp pueda usarlas en Render.
+
+    Render monta /etc/secrets como solo lectura. yt-dlp puede intentar tocar/actualizar
+    cookies durante la extracción; por eso el código nuevo las llevaba a una ruta escribible.
+    """
+    try:
+        if not cookie_path or not os.path.exists(cookie_path):
+            return None
+
+        source_path = os.path.abspath(cookie_path)
+        stat = os.stat(source_path)
+        cached = _COOKIE_RUNTIME_CACHE.get(source_path)
+
+        if (
+            cached
+            and cached.get("mtime") == stat.st_mtime
+            and cached.get("size") == stat.st_size
+            and cached.get("runtime")
+            and os.path.exists(str(cached.get("runtime")))
+        ):
+            return str(cached["runtime"])
+
+        runtime_dir = "/tmp/archeon_ytdlp"
+        os.makedirs(runtime_dir, exist_ok=True)
+
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", os.path.basename(source_path) or "cookies.txt")
+        if source_path.startswith("/etc/secrets/"):
+            safe_name = "render_secret_" + safe_name
+
+        runtime_path = os.path.join(runtime_dir, safe_name)
+
+        try:
+            same_file = os.path.samefile(source_path, runtime_path)
+        except Exception:
+            same_file = os.path.abspath(source_path) == os.path.abspath(runtime_path)
+
+        if same_file:
+            runtime_path = source_path
+        else:
+            import shutil
+            shutil.copyfile(source_path, runtime_path)
+
+        try:
+            os.chmod(runtime_path, 0o600)
+        except Exception:
+            pass
+
+        _COOKIE_RUNTIME_CACHE[source_path] = {
+            "runtime": runtime_path,
+            "mtime": stat.st_mtime,
+            "size": stat.st_size,
+        }
+
+        if source_path.startswith("/etc/secrets/"):
+            logger.info("Cookies secret copiadas a ruta escribible para yt-dlp: %s", runtime_path)
+
+        return runtime_path
+    except Exception as exc:
+        logger.warning("No pude preparar copia escribible de cookies '%s': %s", cookie_path, str(exc)[:180])
+        return None
+
+
+def get_cookiefile_path() -> Optional[str]:
+    """Devuelve cookies válidas usando el orden del código nuevo."""
+    candidates = []
+
+    env_cookie = (os.getenv("YTDLP_COOKIES_FILE") or os.getenv("COOKIES_FILE") or "").strip()
+    if env_cookie:
+        candidates.append(env_cookie)
+
+    candidates.append("/etc/secrets/cookies.txt")
+    candidates.append("cookies.txt")
+
+    seen = set()
+    for cookie_path in candidates:
+        if not cookie_path or cookie_path in seen:
+            continue
+        seen.add(cookie_path)
+
+        if not os.path.exists(cookie_path):
+            continue
+
+        if not _cookiefile_has_youtube_cookie(cookie_path):
+            logger.warning("Ignoro cookies inválidas/no YouTube en: %s", cookie_path)
+            continue
+
+        writable = _writable_cookiefile_copy(cookie_path)
+        if writable and _cookiefile_has_youtube_cookie(writable):
+            return writable
+
+        logger.warning("Cookies válidas, pero no pude crear copia escribible: %s", cookie_path)
+
+    return None
+
+
 def _build_ytdlp_opts(use_cookies: bool = True) -> Dict:
     """Opciones de yt-dlp manteniendo el flujo viejo: una búsqueda y primer resultado."""
     opts = dict(ydl_opts)
-    default_cookie = opts.pop("cookiefile", None)
+    opts.pop("cookiefile", None)
 
     if use_cookies:
-        candidates = [
-            os.getenv("YTDLP_COOKIES_FILE"),
-            os.getenv("COOKIES_FILE"),
-            "/etc/secrets/cookies.txt",
-            default_cookie,
-        ]
-        for candidate in candidates:
-            if candidate and os.path.exists(candidate):
-                try:
-                    if os.path.getsize(candidate) > 0:
-                        opts["cookiefile"] = candidate
-                        break
-                except Exception:
-                    pass
+        cookiefile = get_cookiefile_path()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
 
     return opts
 
@@ -224,13 +326,15 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
     """Mismo query y primer resultado.
 
     Si hay cookies configuradas las prueba primero. Si YouTube devuelve None por cookie mala
-    o bloqueo, intenta el MISMO query una vez sin cookies. No usa búsquedas múltiples ni candidatos.
+    o bloqueo, intenta el MISMO query una vez sin cookies. No usa búsquedas múltiples.
     """
     attempts = []
     opts_with_cookie = _build_ytdlp_opts(use_cookies=True)
 
     if opts_with_cookie.get("cookiefile"):
         attempts.append(("con cookies", opts_with_cookie))
+    else:
+        logger.warning("No encontré cookies válidas para yt-dlp. YouTube puede bloquear Render.")
 
     attempts.append(("sin cookies", _build_ytdlp_opts(use_cookies=False)))
 
@@ -238,6 +342,10 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
 
     for label, opts in attempts:
         try:
+            cookie_used = opts.get("cookiefile")
+            if cookie_used:
+                logger.info("yt-dlp usando cookies desde: %s", cookie_used)
+
             with youtube_dl.YoutubeDL(opts) as ydl:
                 raw_info = await extract_info_async(ydl, search_query, download=False)
 
@@ -252,8 +360,9 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
 
     raise Exception(
         "YouTube bloqueó ese resultado o no devolvió audio. "
-        "Mantengo la búsqueda rápida; si sigue pasando, actualiza cookies.txt en Render."
+        "Se intentó con cookies válidas si estaban disponibles; si sigue pasando, reexporta cookies.txt."
     )
+
 
 # --------------------------
 # Funciones auxiliares
