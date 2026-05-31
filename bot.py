@@ -4074,8 +4074,22 @@ async def on_voice_state_update(member, before, after):
                     logger.info(f"Reconectado al canal de voz {before.channel.name}")
                     
                     # Reanudar reproducción si había
+                    # Reanudar reproducción si había
                     if guild_id in queues and queues[guild_id]:
-                        await check_queue(before.channel.guild)
+                        class SimulatedContext:
+                            def __init__(self, guild):
+                                self.guild = guild
+                                self.voice_client = guild.voice_client
+                                # Intentamos buscar el canal original donde se pidió la música
+                                canal_id = music_origin_channels.get(guild.id)
+                                self.channel = guild.get_channel(canal_id) if canal_id else None
+                            
+                            async def send(self, *args, **kwargs):
+                                if self.channel:
+                                    return await self.channel.send(*args, **kwargs)
+
+                        fake_ctx = SimulatedContext(before.channel.guild)
+                        await check_queue(fake_ctx)
                 except Exception as e:
                     logger.error(f"Error al reconectar: {str(e)}")
                     dj_sessions[guild_id]["active"] = False
@@ -4879,8 +4893,17 @@ async def karaoke_entrar(ctx: commands.Context, *, cancion: str):
         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
             info = await extract_info_async(ydl, cancion if is_url else f"ytsearch:{cancion}", download=False)
         if 'entries' in info:
+            if not info['entries'] or info['entries'][0] is None:
+                raise Exception("YouTube no devolvió resultados o bloqueó esta canción.")
             info = info['entries'][0]
-        url2 = info.get('url') or next((f for f in info['formats'] if f.get('acodec') != 'none'), info['formats'][0])['url']
+
+        if info is None:
+            raise Exception("No se pudo obtener la información del video.")
+
+        url2 = info.get('url') or next(
+            (f for f in info['formats'] if f.get('acodec') != 'none'),
+            info['formats'][0]
+        )['url']
         entry = {"member_id": ctx.author.id, "name": ctx.author.display_name, "song_title": info.get("title") or cancion, "url": url2, "web_url": info.get("webpage_url") or cancion, "score": None}
         session["queue"].append(entry)
         await msg.edit(content=f"✅ {ctx.author.mention} apuntado con **{entry['song_title']}**")
