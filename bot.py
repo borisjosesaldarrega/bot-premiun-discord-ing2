@@ -135,12 +135,12 @@ FFMPEG_OPTIONS = {
 
 # Opciones para youtube_dl
 ydl_opts = {
-    'format': 'bestaudio/best',
+    'format': 'bestaudio[acodec!=none]/bestaudio/best[acodec!=none]/best',
     'default_search': 'ytsearch',
     'noplaylist': True,
     'quiet': True,
     'no_warnings': True,
-    'ignoreerrors': True,
+    'ignoreerrors': False,
     'extract_flat': False,
     'cookiefile': 'cookies.txt',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
@@ -153,10 +153,7 @@ ydl_opts = {
 
 def get_youtube_player_clients() -> List[str]:
     """Clientes de YouTube para una sola extracción rápida."""
-    raw = os.getenv(
-        "YTDLP_YOUTUBE_CLIENTS",
-        "default,-android_sdkless,web_safari,web_embedded,mweb"
-    )
+    raw = os.getenv("YTDLP_YOUTUBE_CLIENTS", "android_vr")
     clients: List[str] = []
     for part in raw.split(","):
         client = part.strip()
@@ -173,20 +170,12 @@ def get_youtube_extractor_args(player_client: Optional[Union[str, List[str]]] = 
     else:
         clients = list(player_client)
 
-    youtube_args: Dict[str, List[str]] = {
-        "player_client": clients,
-        # Clave para que yt-dlp no bote formatos cuando falta PO token.
-        # No cambia de canción ni hace búsquedas extra.
-        "formats": [
-            os.getenv("YTDLP_YOUTUBE_FORMATS", "missing_pot").strip() or "missing_pot"
-        ],
+    return {
+        "youtube": {
+            "player_client": clients,
+            "formats": [os.getenv("YTDLP_YOUTUBE_FORMATS", "missing_pot").strip() or "missing_pot"],
+        }
     }
-
-    po_token = (os.getenv("YTDLP_YOUTUBE_PO_TOKEN") or "").strip()
-    if po_token:
-        youtube_args["po_token"] = [po_token]
-
-    return {"youtube": youtube_args}
 
 
 _COOKIE_RUNTIME_CACHE: Dict[str, Dict[str, Union[str, float, int]]] = {}
@@ -320,14 +309,8 @@ def _build_ytdlp_opts(
     opts = dict(ydl_opts)
     opts.pop("cookiefile", None)
 
-    # Ayuda con YouTube en hosting cloud.
-    if "get_youtube_extractor_args" in globals():
-        opts["extractor_args"] = get_youtube_extractor_args(player_client)
-
-    # No aceptar "metadata sin audio" como resultado bueno.
+    opts["extractor_args"] = get_youtube_extractor_args(player_client)
     opts["ignore_no_formats_error"] = allow_incomplete
-
-    # Evita playlists raras y fuerza IPv4, suele ser más estable en Render.
     opts["noplaylist"] = True
     opts["force_ipv4"] = True
     opts["cachedir"] = False
@@ -336,12 +319,21 @@ def _build_ytdlp_opts(
         "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
     }
 
+    proxy_url = (os.getenv("YTDLP_PROXY") or "").strip()
+    if proxy_url:
+        opts["proxy"] = proxy_url
+
+    impersonate = (os.getenv("YTDLP_IMPERSONATE") or "").strip()
+    if impersonate:
+        opts["impersonate"] = impersonate
+
     if use_cookies:
         cookiefile = get_cookiefile_path()
         if cookiefile:
             opts["cookiefile"] = cookiefile
 
     return opts
+
 
 
 def _first_ytdlp_result(info):
@@ -360,7 +352,7 @@ def _first_ytdlp_result(info):
 
 
 def _audio_url_from_info(info: Dict) -> Optional[str]:
-    """Saca la URL de audio del primer resultado."""
+    """Saca la URL de audio del primer resultado sin buscar alternativas."""
     if not isinstance(info, dict):
         return None
 
@@ -385,34 +377,22 @@ def _audio_url_from_info(info: Dict) -> Optional[str]:
 
     formats = info.get("formats") or []
 
-    def is_good_audio(fmt: Dict) -> bool:
+    def usable(fmt: Dict) -> bool:
         if not isinstance(fmt, dict):
             return False
-        fmt_url = fmt.get("url")
-        if not isinstance(fmt_url, str) or not fmt_url.startswith(("http://", "https://")):
+        url = fmt.get("url")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
             return False
         if fmt.get("has_drm"):
             return False
-        acodec = fmt.get("acodec")
-        if acodec in (None, "none"):
-            return False
-        return True
+        return fmt.get("acodec") not in (None, "none")
 
-    audio_only = [
-        f for f in formats
-        if is_good_audio(f) and f.get("vcodec") in (None, "none")
-    ]
+    audio_only = [f for f in formats if usable(f) and f.get("vcodec") in (None, "none")]
     if audio_only:
-        audio_only.sort(
-            key=lambda f: (
-                0 if f.get("ext") in ("m4a", "webm", "opus") else 1,
-                -(f.get("abr") or 0),
-                -(f.get("tbr") or 0),
-            )
-        )
+        audio_only.sort(key=lambda f: (0 if f.get("ext") in ("m4a", "webm", "opus") else 1, -(f.get("abr") or 0), -(f.get("tbr") or 0)))
         return audio_only[0].get("url")
 
-    with_audio = [f for f in formats if is_good_audio(f)]
+    with_audio = [f for f in formats if usable(f)]
     if with_audio:
         with_audio.sort(key=lambda f: (-(f.get("abr") or 0), -(f.get("tbr") or 0)))
         return with_audio[0].get("url")
@@ -421,14 +401,7 @@ def _audio_url_from_info(info: Dict) -> Optional[str]:
 
 
 async def extract_brute_ytdlp_info(search_query: str) -> Dict:
-    """Extracción rápida estilo viejo.
-
-    Una búsqueda, primer resultado:
-    1) intento con cookies si existen
-    2) intento sin cookies si el primero no da audio
-
-    Sin búsqueda múltiple, sin cambiar de canción, sin fallback de clientes.
-    """
+    """Extracción rápida estilo viejo: una búsqueda, primer resultado."""
     attempts = []
     opts_with_cookie = _build_ytdlp_opts(use_cookies=True)
 
@@ -441,13 +414,20 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
 
     last_title = None
     last_formats = None
-    last_keys = None
+    bot_blocked = False
 
     for label, opts in attempts:
         try:
             cookie_used = opts.get("cookiefile")
             if cookie_used:
                 logger.info("yt-dlp usando cookies desde: %s", cookie_used)
+
+            logger.info(
+                "yt-dlp extracción bruta: query=%s | clientes=%s | cookies=%s",
+                search_query[:80],
+                opts.get("extractor_args", {}).get("youtube", {}).get("player_client"),
+                bool(cookie_used),
+            )
 
             with youtube_dl.YoutubeDL(opts) as ydl:
                 raw_info = await extract_info_async(ydl, search_query, download=False)
@@ -457,32 +437,42 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
                 logger.warning("yt-dlp no devolvió info útil (%s).", label)
                 continue
 
-            url = _audio_url_from_info(info)
-            if url:
+            if _audio_url_from_info(info):
                 return info
 
             last_title = info.get("title", "sin título")
             last_formats = len(info.get("formats") or [])
-            last_keys = list(info.keys())[:12]
             logger.warning(
-                "yt-dlp encontró metadata pero sin audio (%s). Título=%s | formats=%s | keys=%s",
+                "yt-dlp encontró metadata pero sin audio (%s). Título=%s | formats=%s",
                 label,
                 str(last_title)[:120],
                 last_formats,
-                last_keys,
             )
 
         except Exception as e:
-            logger.warning("yt-dlp falló %s para '%s': %s", label, search_query, str(e)[:220])
+            err = str(e)
+            logger.warning("yt-dlp falló %s para '%s': %s", label, search_query, err[:260])
+
+            if "Sign in to confirm" in err or "not a bot" in err:
+                bot_blocked = True
+                if label == "con cookies":
+                    break
+
+    if bot_blocked:
+        raise Exception(
+            "YouTube rechazó la extracción por anti-bot aunque cargué cookies. "
+            "Reexporta cookies.txt desde una sesión nueva de YouTube. "
+            "Si Render sigue bloqueado, usa YTDLP_PROXY o PO token."
+        )
 
     if last_title:
         raise Exception(
             f"YouTube encontró **{str(last_title)[:80]}**, pero no entregó audio reproducible "
-            f"(formats={last_formats}). Revisa que yt-dlp esté actualizado y que cookies.txt sea reciente."
+            f"(formats={last_formats}). Actualiza yt-dlp/cookies o prueba una URL directa."
         )
 
     raise Exception(
-        "YouTube no devolvió audio reproducible. Revisa yt-dlp/cookies.txt o prueba una URL directa."
+        "YouTube no devolvió audio reproducible. Actualiza yt-dlp/cookies o prueba una URL directa."
     )
 
 
@@ -921,7 +911,7 @@ async def play(ctx: commands.Context, *, busqueda: str) -> None:
     voice_client = ctx.voice_client or await safe_connect(ctx.author.voice.channel)
 
     try:
-        search_query = busqueda if is_url else f"ytsearch:{busqueda}"
+        search_query = busqueda if is_url else f"ytsearch1:{busqueda}"
         info = await extract_brute_ytdlp_info(search_query)
         url2 = _audio_url_from_info(info)
 
@@ -1186,7 +1176,7 @@ async def playtop(ctx: commands.Context, *, busqueda: str) -> None:
     with youtube_dl.YoutubeDL(ydl_opts) as ydl:
         try:
             info = await extract_brute_ytdlp_info(
-                busqueda if is_url else f"ytsearch:{busqueda}"
+                busqueda if is_url else f"ytsearch1:{busqueda}"
             )
             url2 = _audio_url_from_info(info)
 
@@ -1488,7 +1478,7 @@ async def dj_mode(ctx: commands.Context, *, query: str = None):
                 with youtube_dl.YoutubeDL(ydl_opts) as ydl:
                     info = await extract_info_async(
                         ydl,
-                        f"ytsearch:{term}",
+                        f"ytsearch1:{term}",
                         download=False
                     )
 
@@ -1668,7 +1658,7 @@ async def auto_add_songs_task(guild):
                         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
                             info = await extract_info_async(
                                 ydl,
-                                f"ytsearch:{term}",
+                                f"ytsearch1:{term}",
                                 download=False
                             )
 
@@ -3049,7 +3039,7 @@ async def play_slash(interaction: discord.Interaction, busqueda: str):
         # Extraer información del audio
         try:
             info = await extract_brute_ytdlp_info(
-                busqueda if URL_REGEX.match(busqueda) else f"ytsearch:{busqueda}"
+                busqueda if URL_REGEX.match(busqueda) else f"ytsearch1:{busqueda}"
             )
             audio_url = _audio_url_from_info(info)
 
@@ -3346,7 +3336,7 @@ async def playtop_slash(ctx: discord.Interaction, *, busqueda: str):
     with youtube_dl.YoutubeDL(ydl_opts) as ydl:
         try:
             info = await extract_brute_ytdlp_info(
-                busqueda if is_url else f"ytsearch:{busqueda}"
+                busqueda if is_url else f"ytsearch1:{busqueda}"
             )
             url2 = _audio_url_from_info(info)
 
@@ -3655,7 +3645,7 @@ async def auto_add_songs_task(guild):
                         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
                             info = await extract_info_async(
                                 ydl,
-                                f"ytsearch:{term}",
+                                f"ytsearch1:{term}",
                                 download=False
                             )
 
@@ -3813,7 +3803,7 @@ async def process_search_terms(interaction, search_terms: List[str]) -> int:
     for term in search_terms:
         try:
             with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-                info = await extract_info_async(ydl, f"ytsearch:{term}", download=False)
+                info = await extract_info_async(ydl, f"ytsearch1:{term}", download=False)
 
             if 'entries' in info:
                 info = info['entries'][0]
@@ -5222,7 +5212,7 @@ async def karaoke_entrar(ctx: commands.Context, *, cancion: str):
     msg = await ctx.send("🔍 Buscando tu canción para karaoke...")
     try:
         is_url = bool(URL_REGEX.match(cancion))
-        info = await extract_brute_ytdlp_info(cancion if is_url else f"ytsearch:{cancion}")
+        info = await extract_brute_ytdlp_info(cancion if is_url else f"ytsearch1:{cancion}")
         url2 = _audio_url_from_info(info)
 
         if not url2:
