@@ -330,8 +330,17 @@ def _audio_url_from_info(info: Dict) -> Optional[str]:
     if not isinstance(info, dict):
         return None
 
-    if info.get("url"):
-        return info.get("url")
+    for key in ("requested_downloads", "requested_formats"):
+        items = info.get(key) or []
+        if isinstance(items, dict):
+            items = [items]
+        for item in items:
+            if isinstance(item, dict) and item.get("url"):
+                return item.get("url")
+
+    direct_url = info.get("url")
+    if isinstance(direct_url, str) and direct_url.startswith(("http://", "https://")):
+        return direct_url
 
     formats = info.get("formats") or []
 
@@ -349,8 +358,10 @@ def _audio_url_from_info(info: Dict) -> Optional[str]:
             return fmt.get("url")
 
     for fmt in formats:
-        if isinstance(fmt, dict) and fmt.get("url"):
-            return fmt.get("url")
+        if isinstance(fmt, dict):
+            fmt_url = fmt.get("url")
+            if isinstance(fmt_url, str) and fmt_url.startswith(("http://", "https://")):
+                return fmt_url
 
     return None
 
@@ -358,8 +369,8 @@ def _audio_url_from_info(info: Dict) -> Optional[str]:
 async def extract_brute_ytdlp_info(search_query: str) -> Dict:
     """Mismo query y primer resultado.
 
-    Si hay cookies configuradas las prueba primero. Si YouTube devuelve None por cookie mala
-    o bloqueo, intenta el MISMO query una vez sin cookies. No usa búsquedas múltiples.
+    Si YouTube devuelve metadata sin audio, intenta el MISMO query una vez sin cookies.
+    No usa búsquedas múltiples ni cambia a otro resultado.
     """
     attempts = []
     opts_with_cookie = _build_ytdlp_opts(use_cookies=True)
@@ -371,8 +382,6 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
 
     attempts.append(("sin cookies", _build_ytdlp_opts(use_cookies=False)))
 
-    last_error = None
-
     for label, opts in attempts:
         try:
             cookie_used = opts.get("cookiefile")
@@ -383,17 +392,23 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
                 raw_info = await extract_info_async(ydl, search_query, download=False)
 
             info = _first_ytdlp_result(raw_info)
-            if info:
+            if info and _audio_url_from_info(info):
                 return info
 
-            last_error = Exception(f"YouTube devolvió resultado vacío ({label}).")
+            title = info.get("title", "sin título") if isinstance(info, dict) else "sin info"
+            keys = list(info.keys())[:12] if isinstance(info, dict) else []
+            logger.warning(
+                "yt-dlp obtuvo metadata pero sin audio (%s). Título=%s | keys=%s",
+                label,
+                str(title)[:120],
+                keys,
+            )
         except Exception as e:
-            last_error = e
             logger.warning("yt-dlp falló %s para '%s': %s", label, search_query, str(e)[:180])
 
     raise Exception(
-        "YouTube bloqueó ese resultado o no devolvió audio. "
-        "Se intentó con cookies válidas si estaban disponibles; si sigue pasando, reexporta cookies.txt."
+        "YouTube devolvió la canción pero sin enlace de audio reproducible. "
+        "Prueba reexportar cookies.txt o usar otra URL/canción."
     )
 
 
@@ -807,7 +822,7 @@ async def join(ctx: commands.Context) -> None:
         
 @bot.command(name='play', aliases=['p', 'reproduce', 'ponme'])
 async def play(ctx: commands.Context, *, busqueda: str) -> None:
-    """Reproduce música o la añade a la cola - CORREGIDO para búsqueda por nombre"""
+    """Reproduce música o la añade a la cola - búsqueda rápida estilo viejo."""
     if not check_same_voice_channel(ctx):
         return await ctx.send("❌ Debes estar en el mismo canal de voz que el bot para usar este comando.")
     await update_last_activity(ctx.guild.id)
@@ -819,8 +834,7 @@ async def play(ctx: commands.Context, *, busqueda: str) -> None:
         🌟 *Pronto disfrutarás de tu música favorita*""",
         color=discord.Color.blurple()
     )
-    # Añadir un footer y thumbnail para más estilo
-    embed_cargando.set_thumbnail(url="https://pa1.aminoapps.com/6183/fa929a44ff5e7a72230d9974b0914d4b4f7c4e41_hq.gif")  # Puedes usar un gif de música o carga
+    embed_cargando.set_thumbnail(url="https://pa1.aminoapps.com/6183/fa929a44ff5e7a72230d9974b0914d4b4f7c4e41_hq.gif")
     embed_cargando.set_footer(text="🎶 Paciencia, buen música está por venir...", icon_url="https://img.icons8.com/?size=100&id=LoeQXgICz0wZ&format=png&color=000000")
 
     cargando_msg = await ctx.send(embed=embed_cargando)
@@ -840,68 +854,71 @@ async def play(ctx: commands.Context, *, busqueda: str) -> None:
         if not url2:
             raise Exception("No se pudo obtener la URL del audio.")
 
-            # Construir el objeto de la canción
-            song = {
-                "title": info.get("title", busqueda)[:200],  # Limitar longitud
-                "url": url2,
-                "web_url": info.get("webpage_url", busqueda),
-                "duration": int(info.get("duration", 0)),
-                "requested_by": ctx.author,
-                "thumbnail": info.get("thumbnail", "")
-            }
+        song = {
+            "title": (info.get("title") or busqueda)[:200],
+            "url": url2,
+            "web_url": info.get("webpage_url") or info.get("original_url") or busqueda,
+            "duration": int(info.get("duration") or 0),
+            "requested_by": ctx.author,
+            "thumbnail": info.get("thumbnail", "")
+        }
 
+        try:
             await cargando_msg.delete()
+        except Exception:
+            pass
 
-            # Si ya hay música sonando, añadir a la cola
-            if voice_client.is_playing() or voice_client.is_paused():
-                queues.setdefault(ctx.guild.id, []).append(song)
-
-                embed = discord.Embed(
-                    title="🎵 Añadido a la cola",
-                    description=f"[{song['title']}]({song['web_url']})",
-                    color=discord.Color.green()
-                )
-                embed.add_field(name="Posición en cola", value=str(len(queues[ctx.guild.id])))
-                embed.set_thumbnail(url=song['thumbnail'])
-                embed.set_footer(text=f"Solicitado por {ctx.author.display_name}")
-                return await ctx.send(embed=embed)
-
-            # Reproducir inmediatamente
-            global current_song
-            current_song = song
-            save_to_history(ctx.guild.id, current_song)
-
-            source = await discord.FFmpegOpusAudio.from_probe(
-                url2,
-                method='fallback',
-                **FFMPEG_OPTIONS
-            )
-
-            voice_client.play(
-                source,
-                after=lambda e: asyncio.run_coroutine_threadsafe(
-                    check_queue(ctx),
-                    bot.loop
-                ) if e is None else print(f'Error: {e}')
-            )
+        if voice_client.is_playing() or voice_client.is_paused():
+            queues.setdefault(ctx.guild.id, []).append(song)
 
             embed = discord.Embed(
-                title="🎵 Reproduciendo ahora",
-                description=f"[{current_song['title']}]({current_song['web_url']})",
-                color=discord.Color.blurple()
+                title="🎵 Añadido a la cola",
+                description=f"[{song['title']}]({song['web_url']})",
+                color=discord.Color.green()
             )
-            duration = current_song['duration']
-            if duration > 0:
-                embed.add_field(name="Duración", value=f"{duration // 60}:{duration % 60:02d}")
-            else:
-                embed.add_field(name="Duración", value="Desconocida")
-            embed.set_thumbnail(url=current_song['thumbnail'])
+            embed.add_field(name="Posición en cola", value=str(len(queues[ctx.guild.id])))
+            embed.set_thumbnail(url=song['thumbnail'])
             embed.set_footer(text=f"Solicitado por {ctx.author.display_name}")
+            return await ctx.send(embed=embed)
 
-            await ctx.send(embed=embed)
+        global current_song
+        current_song = song
+        save_to_history(ctx.guild.id, current_song)
+
+        source = await discord.FFmpegOpusAudio.from_probe(
+            url2,
+            method='fallback',
+            **FFMPEG_OPTIONS
+        )
+
+        voice_client.play(
+            source,
+            after=lambda e: asyncio.run_coroutine_threadsafe(
+                check_queue(ctx),
+                bot.loop
+            ) if e is None else print(f'Error: {e}')
+        )
+
+        embed = discord.Embed(
+            title="🎵 Reproduciendo ahora",
+            description=f"[{current_song['title']}]({current_song['web_url']})",
+            color=discord.Color.blurple()
+        )
+        duration = current_song['duration']
+        embed.add_field(
+            name="Duración",
+            value=f"{duration // 60}:{duration % 60:02d}" if duration else "Desconocida"
+        )
+        embed.set_thumbnail(url=current_song['thumbnail'])
+        embed.set_footer(text=f"Solicitado por {ctx.author.display_name}")
+
+        await ctx.send(embed=embed)
 
     except Exception as e:
-        await cargando_msg.delete()
+        try:
+            await cargando_msg.delete()
+        except Exception:
+            pass
         error_msg = f"❌ Error al reproducir: {str(e)}"
         if "formats" in str(e):
             error_msg += "\n⚠️ Problema al obtener formatos de audio. Intenta con otro video."
@@ -1841,6 +1858,42 @@ MODERATION_SETTINGS = {
     "spam_cooldown": 300
 }
 
+GEMINI_QUOTA_PAUSE_UNTIL = 0.0
+
+
+def _empty_moderation_analysis() -> Dict[str, float]:
+    return {
+        "toxicidad": 0,
+        "acoso": 0,
+        "amenazas": 0,
+        "spam": 0,
+        "enlaces_maliciosos": 0,
+    }
+
+
+def _gemini_quota_is_paused() -> bool:
+    return time.time() < GEMINI_QUOTA_PAUSE_UNTIL
+
+
+def _mark_gemini_quota_pause(error: Exception, default_seconds: int = 90) -> None:
+    """Evita spamear Gemini cuando ya respondió 429/cuota excedida."""
+    global GEMINI_QUOTA_PAUSE_UNTIL
+    text_error = str(error)
+    lower_error = text_error.lower()
+    if "429" not in text_error and "quota" not in lower_error and "rate" not in lower_error:
+        return
+
+    delay = default_seconds
+    match = re.search(r"retry(?: in|Delay[^0-9]*)([0-9]+(?:\.[0-9]+)?)s", text_error, re.IGNORECASE)
+    if match:
+        try:
+            delay = max(default_seconds, int(float(match.group(1))) + 5)
+        except Exception:
+            delay = default_seconds
+
+    GEMINI_QUOTA_PAUSE_UNTIL = max(GEMINI_QUOTA_PAUSE_UNTIL, time.time() + delay)
+    logger.warning("Gemini está en cuota/rate-limit. Pauso análisis con IA por %s segundos.", delay)
+
 def save_moderation_data():
     """Guarda los datos de moderación en un archivo JSON"""
     data = {
@@ -1907,7 +1960,10 @@ async def load_malicious_domains():
         ])
 
 async def analyze_message_content(message: discord.Message) -> Dict[str, float]:
-    """Analiza el contenido del mensaje usando IA para detectar problemas"""
+    """Analiza el contenido del mensaje usando IA para detectar problemas."""
+    if _gemini_quota_is_paused():
+        return _empty_moderation_analysis()
+
     try:
         prompt = (
             "Analiza el siguiente mensaje de Discord y responde ÚNICAMENTE con un objeto JSON con puntuaciones entre 0 y 1, así:\n"
@@ -1925,28 +1981,18 @@ async def analyze_message_content(message: discord.Message) -> Dict[str, float]:
 
         if not respuesta_texto.startswith("{"):
             logger.error(f"Respuesta inválida de la IA: '{respuesta_texto[:100]}'")
-            return {
-                "toxicidad": 0,
-                "acoso": 0,
-                "amenazas": 0,
-                "spam": 0,
-                "enlaces_maliciosos": 0
-            }
+            return _empty_moderation_analysis()
 
-        analysis = json.loads(respuesta_texto)
-        return analysis
+        return json.loads(respuesta_texto)
+
     except Exception as e:
-        logger.error(f"Error al analizar mensaje: {e}")
-        return {
-            "toxicidad": 0,
-            "acoso": 0,
-            "amenazas": 0,
-            "spam": 0,
-            "enlaces_maliciosos": 0
-        }
+        _mark_gemini_quota_pause(e)
+        if not _gemini_quota_is_paused():
+            logger.error(f"Error al analizar mensaje: {e}")
+        return _empty_moderation_analysis()
 
 async def check_malicious_links(content: str) -> bool:
-    """Verifica si el mensaje contiene enlaces maliciosos"""
+    """Verifica si el mensaje contiene enlaces maliciosos."""
     urls = URL_REGEX.findall(content)
     if not urls:
         return False
@@ -1957,6 +2003,9 @@ async def check_malicious_links(content: str) -> bool:
 
         if domain in malicious_domains:
             return True
+
+        if _gemini_quota_is_paused():
+            continue
 
         try:
             prompt = (
@@ -1972,7 +2021,8 @@ async def check_malicious_links(content: str) -> bool:
                 malicious_domains.add(domain)
                 save_moderation_data()
                 return True
-        except Exception:
+        except Exception as e:
+            _mark_gemini_quota_pause(e)
             continue
 
     return False
@@ -2063,9 +2113,12 @@ async def apply_ban(user: discord.Member, reason: str):
         logger.error(f"Error al aplicar ban: {e}")
 
 async def check_channel_tolerance(channel: discord.TextChannel) -> bool:
-    """Determina si un canal permite lenguaje más relajado"""
+    """Determina si un canal permite lenguaje más relajado."""
     if channel.id in allowed_channels:
         return allowed_channels[channel.id]
+
+    if _gemini_quota_is_paused():
+        return False
 
     try:
         messages = [m.clean_content async for m in channel.history(limit=20)]
@@ -2083,7 +2136,8 @@ async def check_channel_tolerance(channel: discord.TextChannel) -> bool:
         allowed_channels[channel.id] = is_relaxed
         save_moderation_data()
         return is_relaxed
-    except Exception:
+    except Exception as e:
+        _mark_gemini_quota_pause(e)
         return False
 
 async def moderate_message(message: discord.Message):
@@ -4235,6 +4289,11 @@ async def on_message(message):
         # Procesar comandos primero
         await bot.process_commands(message)
 
+        # No gastar Gemini/moderación en comandos. Si el usuario escribió ¡play,
+        # ya se atendió arriba; analizarlo otra vez solo quema cuota.
+        if message.content.strip().startswith("¡"):
+            return
+
         # Aplicar moderación si no es mensaje de bypass
         if message.id not in bypass_messages:
             try:
@@ -5419,12 +5478,13 @@ async def ticket_panel_slash_moderno(interaction: discord.Interaction):
 # Bienvenida visual
 # --------------------------
 async def build_welcome_card(member: discord.Member) -> Optional[discord.File]:
-    """Crea una tarjeta de bienvenida moderna para Discord."""
+    """Crea una tarjeta de bienvenida moderna, limpia y minimalista para Discord."""
     try:
-        from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
+        from PIL import Image, ImageDraw, ImageFont, ImageOps
 
         width, height = 1200, 430
 
+        # Función para cargar fuentes
         def font(size: int, bold: bool = False):
             candidates = [
                 "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf",
@@ -5437,6 +5497,7 @@ async def build_welcome_card(member: discord.Member) -> Optional[discord.File]:
                     return ImageFont.truetype(fp, size)
             return ImageFont.load_default()
 
+        # Función para auto-ajustar el texto
         def fit_text(draw_obj, text: str, max_width: int, start_size: int, bold: bool = False, min_size: int = 24):
             size = start_size
             while size >= min_size:
@@ -5447,119 +5508,111 @@ async def build_welcome_card(member: discord.Member) -> Optional[discord.File]:
                 size -= 2
             return font(min_size, bold)
 
+        # Máscara para bordes redondeados
         def rounded_rect_mask(size, radius):
             mask = Image.new("L", size, 0)
             md = ImageDraw.Draw(mask)
             md.rounded_rectangle((0, 0, size[0] - 1, size[1] - 1), radius=radius, fill=255)
             return mask
 
-        # Fondo principal con degradado oscuro.
-        img = Image.new("RGBA", (width, height), (9, 13, 23, 255))
-        bg = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        bg_draw = ImageDraw.Draw(bg)
-        for y in range(height):
-            r = int(10 + (y / height) * 8)
-            g = int(17 + (y / height) * 18)
-            b = int(31 + (y / height) * 34)
-            bg_draw.line([(0, y), (width, y)], fill=(r, g, b, 255))
-        img.alpha_composite(bg)
-
+        # 1. Fondo principal (Gris oscuro sólido y elegante)
+        # Usamos un tono muy oscuro y neutro, sin gradientes escandalosos.
+        bg_color = (15, 17, 21, 255)
+        img = Image.new("RGBA", (width, height), bg_color)
         draw = ImageDraw.Draw(img)
 
-        # Brillos suaves y detalles del fondo.
-        glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        gd = ImageDraw.Draw(glow)
-        gd.ellipse((-180, -160, 430, 450), fill=(34, 211, 238, 42))
-        gd.ellipse((760, -220, 1320, 360), fill=(99, 102, 241, 34))
-        gd.ellipse((690, 260, 1320, 610), fill=(245, 158, 11, 20))
-        glow = glow.filter(ImageFilter.GaussianBlur(46))
-        img.alpha_composite(glow)
-
-        # Marco general.
-        card_margin = 32
+        # 2. Marco general sutil (Borde gris claro muy fino)
+        card_margin = 24
         draw.rounded_rectangle(
             (card_margin, card_margin, width - card_margin, height - card_margin),
-            radius=34,
-            fill=(15, 23, 42, 232),
-            outline=(34, 211, 238, 150),
+            radius=24,
+            fill=(22, 25, 31, 255),  # Un gris un pelín más claro que el fondo
+            outline=(45, 50, 60, 255), # Borde sutil
+            width=2
+        )
+
+        # 3. Procesamiento del Avatar del usuario
+        avatar_bytes = await member.display_avatar.replace(size=256, static_format="png").read()
+        avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+        
+        # Tamaño del avatar y recorte circular perfecto
+        avatar_size = 200
+        avatar = ImageOps.fit(avatar, (avatar_size, avatar_size), centering=(0.5, 0.5))
+        
+        avatar_mask = Image.new("L", (avatar_size, avatar_size), 0)
+        avatar_mask_draw = ImageDraw.Draw(avatar_mask)
+        avatar_mask_draw.ellipse((0, 0, avatar_size, avatar_size), fill=255)
+        
+        # Posicionamiento del avatar
+        avatar_x, avatar_y = 80, 115
+        img.paste(avatar, (avatar_x, avatar_y), avatar_mask)
+        
+        # Anillo simple y elegante alrededor del avatar
+        draw.ellipse(
+            (avatar_x - 4, avatar_y - 4, avatar_x + avatar_size + 4, avatar_y + avatar_size + 4),
+            outline=(200, 200, 200, 255), # Blanco platinado
             width=3
         )
 
-        # Barra lateral de acento.
-        draw.rounded_rectangle((32, 32, 43, height - 32), radius=8, fill=(34, 211, 238, 255))
-        draw.rounded_rectangle((43, 32, 48, height - 32), radius=8, fill=(245, 158, 11, 200))
-
-        # Decoración sutil.
-        for x, y, s, c in [
-            (1000, 78, 7, (34, 211, 238, 180)),
-            (1045, 310, 5, (245, 158, 11, 180)),
-            (226, 84, 4, (147, 197, 253, 150)),
-            (1110, 142, 4, (255, 255, 255, 110)),
-            (905, 335, 3, (34, 211, 238, 150)),
-        ]:
-            draw.ellipse((x - s, y - s, x + s, y + s), fill=c)
-
-        # Avatar del usuario.
-        avatar_bytes = await member.display_avatar.replace(size=256, static_format="png").read()
-        avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
-        avatar = ImageOps.fit(avatar, (190, 190), centering=(0.5, 0.5))
-
-        avatar_mask = Image.new("L", (190, 190), 0)
-        avatar_mask_draw = ImageDraw.Draw(avatar_mask)
-        avatar_mask_draw.ellipse((0, 0, 190, 190), fill=255)
-
-        # Glow del avatar.
-        avatar_glow = Image.new("RGBA", (260, 260), (0, 0, 0, 0))
-        agd = ImageDraw.Draw(avatar_glow)
-        agd.ellipse((26, 26, 234, 234), fill=(34, 211, 238, 95))
-        avatar_glow = avatar_glow.filter(ImageFilter.GaussianBlur(18))
-        img.alpha_composite(avatar_glow, (64, 83))
-
-        img.paste(avatar, (100, 118), avatar_mask)
-        draw.ellipse((94, 112, 296, 314), outline=(34, 211, 238, 255), width=6)
-        draw.ellipse((86, 104, 304, 322), outline=(245, 158, 11, 155), width=3)
-
-        # Textos principales.
+        # 4. Textos principales (Jerarquía limpia)
         guild_name = (member.guild.name or "el servidor")[:34]
         member_count = member.guild.member_count or len(member.guild.members)
-        display = member.display_name[:32]
+        display = member.display_name[:30]
 
-        small_title = font(28, True)
-        username_font = fit_text(draw, display, 710, 58, True, 34)
-        body_font = font(31)
-        stat_font = font(26, True)
-        foot_font = font(20)
+        # Fuentes
+        small_title = font(22, True)
+        username_font = fit_text(draw, display, 750, 64, True, 34)
+        body_font = font(28)
+        stat_font = font(22, True)
+        foot_font = font(18)
 
-        draw.text((340, 104), "¡BIENVENIDO/A!", font=small_title, fill=(34, 211, 238, 255))
-        draw.text((340, 150), display, font=username_font, fill=(248, 250, 252, 255))
-        draw.text((340, 224), f"Ahora formas parte de {guild_name}", font=body_font, fill=(203, 213, 225, 255))
+        text_x = 320
 
-        # Pill inferior.
-        pill_x1, pill_y1, pill_x2, pill_y2 = 340, 286, width - 86, 354
-        draw.rounded_rectangle((pill_x1, pill_y1, pill_x2, pill_y2), radius=28, fill=(2, 6, 23, 210), outline=(51, 65, 85, 180), width=2)
+        # Subtítulo (Bienvenida)
+        draw.text((text_x, 115), "BIENVENIDO", font=small_title, fill=(150, 155, 165, 255))
+        
+        # Nombre de usuario (Gran contraste)
+        draw.text((text_x, 145), display, font=username_font, fill=(255, 255, 255, 255))
+        
+        # Mensaje de servidor
+        draw.text((text_x, 225), f"Te has unido a {guild_name}", font=body_font, fill=(180, 185, 195, 255))
 
-        draw.text((372, 304), f"Miembro #{member_count}", font=stat_font, fill=(34, 211, 238, 255))
-        draw.text((570, 304), "•", font=stat_font, fill=(148, 163, 184, 255))
-        draw.text((604, 304), "Lee las reglas, saluda y disfruta la comunidad", font=stat_font, fill=(241, 245, 249, 255))
+        # 5. Cápsula inferior (Estadísticas e info)
+        pill_x1, pill_y1 = text_x, 285
+        pill_x2, pill_y2 = width - 60, 345
+        
+        draw.rounded_rectangle(
+            (pill_x1, pill_y1, pill_x2, pill_y2), 
+            radius=16, 
+            fill=(15, 17, 21, 255), 
+            outline=(45, 50, 60, 255), 
+            width=1
+        )
 
-        # Footer discreto.
-        draw.text((86, 374), "Archeon • Sistema de bienvenida", font=foot_font, fill=(148, 163, 184, 255))
-        draw.text((width - 300, 374), "Comunidad activa ✦ Respeto ✦ Diversión", font=foot_font, fill=(100, 116, 139, 255))
+        # Texto dentro de la cápsula
+        draw.text((pill_x1 + 30, pill_y1 + 16), f"Miembro #{member_count}", font=stat_font, fill=(255, 255, 255, 255))
+        draw.text((pill_x1 + 210, pill_y1 + 16), "|", font=stat_font, fill=(100, 105, 115, 255))
+        draw.text((pill_x1 + 235, pill_y1 + 16), "Disfruta tu estadía en la comunidad.", font=stat_font, fill=(160, 165, 175, 255))
 
-        # Recorte final redondeado.
+        # 6. Footer del sistema (Branding discreto de Archeon)
+        draw.text((60, height - 60), "Archeon System", font=foot_font, fill=(100, 105, 115, 255))
+
+        # 7. Recorte final redondeado de toda la tarjeta
         final = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        final_mask = rounded_rect_mask((width, height), 36)
+        final_mask = rounded_rect_mask((width, height), 24)
         final.paste(img, (0, 0), final_mask)
 
+        # 8. Exportar
         buffer = io.BytesIO()
-        final.convert("RGB").save(buffer, format="PNG", optimize=True)
+        # Mantenemos RGBA y guardamos como PNG para mantener la transparencia de los bordes redondeados
+        final.save(buffer, format="PNG", optimize=True)
         buffer.seek(0)
+        
         return discord.File(buffer, filename="bienvenida_archeon.png")
 
     except Exception:
         logger.error(f"No pude generar card de bienvenida: {traceback.format_exc()}")
         return None
-
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -5779,5 +5832,6 @@ async def on_ready():
         create_logged_task(safe_background_task(save_data_periodically), "save_data_periodically")
         bot._dz_background_started = True
         logger.info("Tareas en segundo plano iniciadas con manejo seguro")
+
 
 bot.run(TOKEN)
