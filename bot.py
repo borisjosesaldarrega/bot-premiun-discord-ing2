@@ -152,14 +152,26 @@ ydl_opts = {
 }
 
 def get_youtube_player_clients() -> List[str]:
-    """Clientes de YouTube para una sola extracción rápida."""
-    raw = os.getenv("YTDLP_YOUTUBE_CLIENTS", "android_vr")
-    clients: List[str] = []
-    for part in raw.split(","):
-        client = part.strip()
-        if client and client not in clients:
-            clients.append(client)
-    return clients or ["default", "-android_sdkless", "web_safari", "web_embedded", "mweb"]
+    """Cliente único para mantener música rápida.
+
+    IMPORTANTE:
+    Ignora YTDLP_YOUTUBE_CLIENTS a propósito, porque en Render quedó con una lista vieja
+    tipo default,android_vr,android,ios... y eso dispara el anti-bot con el cliente default.
+    Si quieres cambiarlo, usa YTDLP_FORCE_CLIENT=android_vr/web_embedded/web_safari.
+    """
+    forced = (os.getenv("YTDLP_FORCE_CLIENT") or "android_vr").strip()
+    if not forced:
+        forced = "android_vr"
+
+    if os.getenv("YTDLP_YOUTUBE_CLIENTS"):
+        logger.warning(
+            "Ignorando YTDLP_YOUTUBE_CLIENTS=%s; usando cliente único=%s",
+            os.getenv("YTDLP_YOUTUBE_CLIENTS"),
+            forced,
+        )
+
+    return [forced]
+
 
 
 def get_youtube_extractor_args(player_client: Optional[Union[str, List[str]]] = None) -> Dict[str, Dict[str, List[str]]]:
@@ -172,7 +184,7 @@ def get_youtube_extractor_args(player_client: Optional[Union[str, List[str]]] = 
 
     return {
         "youtube": {
-            "player_client": clients,
+            "player_client": clients[:1],  # una sola ruta, bruto y rápido
             "formats": [os.getenv("YTDLP_YOUTUBE_FORMATS", "missing_pot").strip() or "missing_pot"],
         }
     }
@@ -319,6 +331,18 @@ def _build_ytdlp_opts(
         "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
     }
 
+    # Deno/EJS explícito para yt-dlp en Python API.
+    try:
+        import shutil
+        deno_path = shutil.which("deno") or "/opt/render/project/src/.deno/bin/deno"
+        if deno_path and os.path.exists(deno_path):
+            deno_dir = os.path.dirname(deno_path)
+            if deno_dir and deno_dir not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = deno_dir + os.pathsep + os.environ.get("PATH", "")
+            opts["js_runtimes"] = {"deno": {}}
+    except Exception:
+        pass
+
     proxy_url = (os.getenv("YTDLP_PROXY") or "").strip()
     if proxy_url:
         opts["proxy"] = proxy_url
@@ -401,16 +425,21 @@ def _audio_url_from_info(info: Dict) -> Optional[str]:
 
 
 async def extract_brute_ytdlp_info(search_query: str) -> Dict:
-    """Extracción rápida estilo viejo: una búsqueda, primer resultado."""
-    attempts = []
+    """Extracción rápida estilo viejo: una búsqueda, primer resultado.
+
+    Orden:
+    1) sin cookies + cliente único android_vr
+    2) con cookies + mismo cliente
+
+    Esto evita que cookies de otra IP/país disparen anti-bot en Render.
+    """
+    opts_no_cookie = _build_ytdlp_opts(use_cookies=False)
     opts_with_cookie = _build_ytdlp_opts(use_cookies=True)
 
-    if opts_with_cookie.get("cookiefile"):
-        attempts.append(("con cookies", opts_with_cookie))
+    if os.getenv("YTDLP_COOKIES_FIRST", "").lower() in {"1", "true", "yes", "on"}:
+        attempts = [("con cookies", opts_with_cookie), ("sin cookies", opts_no_cookie)]
     else:
-        logger.warning("No encontré cookies válidas para yt-dlp. YouTube puede bloquear Render.")
-
-    attempts.append(("sin cookies", _build_ytdlp_opts(use_cookies=False)))
+        attempts = [("sin cookies", opts_no_cookie), ("con cookies", opts_with_cookie)]
 
     last_title = None
     last_formats = None
@@ -423,10 +452,11 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
                 logger.info("yt-dlp usando cookies desde: %s", cookie_used)
 
             logger.info(
-                "yt-dlp extracción bruta: query=%s | clientes=%s | cookies=%s",
+                "yt-dlp BRUTO: query=%s | cliente=%s | cookies=%s | deno=%s",
                 search_query[:80],
                 opts.get("extractor_args", {}).get("youtube", {}).get("player_client"),
                 bool(cookie_used),
+                bool(opts.get("js_runtimes")),
             )
 
             with youtube_dl.YoutubeDL(opts) as ydl:
@@ -455,24 +485,24 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
 
             if "Sign in to confirm" in err or "not a bot" in err:
                 bot_blocked = True
+                # Si el intento con cookies también cae anti-bot, no hay más que hacer sin proxy/PO.
                 if label == "con cookies":
                     break
 
     if bot_blocked:
         raise Exception(
-            "YouTube rechazó la extracción por anti-bot aunque cargué cookies. "
-            "Reexporta cookies.txt desde una sesión nueva de YouTube. "
-            "Si Render sigue bloqueado, usa YTDLP_PROXY o PO token."
+            "YouTube rechazó la extracción por anti-bot. Ya forcé cliente único y Deno/EJS. "
+            "Reexporta cookies o usa YTDLP_PROXY si Render tiene la IP quemada."
         )
 
     if last_title:
         raise Exception(
             f"YouTube encontró **{str(last_title)[:80]}**, pero no entregó audio reproducible "
-            f"(formats={last_formats}). Actualiza yt-dlp/cookies o prueba una URL directa."
+            f"(formats={last_formats}). Reexporta cookies o prueba URL directa."
         )
 
     raise Exception(
-        "YouTube no devolvió audio reproducible. Actualiza yt-dlp/cookies o prueba una URL directa."
+        "YouTube no devolvió audio reproducible. Reexporta cookies o prueba una URL directa."
     )
 
 
