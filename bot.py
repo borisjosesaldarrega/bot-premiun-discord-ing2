@@ -151,6 +151,25 @@ ydl_opts = {
     'no-cache-dir': True
 }
 
+def get_youtube_player_clients() -> List[str]:
+    """Clientes alternos de YouTube como en el código nuevo, sin buscar más resultados."""
+    raw = os.getenv("YTDLP_YOUTUBE_CLIENTS", "default,android_vr,android,ios,web_safari")
+    clients: List[str] = []
+    for part in raw.split(","):
+        client = part.strip()
+        if client and client not in clients:
+            clients.append(client)
+    return clients or ["default", "android_vr"]
+
+
+def get_youtube_extractor_args() -> Dict[str, Dict[str, List[str]]]:
+    return {
+        "youtube": {
+            "player_client": get_youtube_player_clients(),
+        }
+    }
+
+
 _COOKIE_RUNTIME_CACHE: Dict[str, Dict[str, Union[str, float, int]]] = {}
 
 
@@ -224,6 +243,8 @@ def _writable_cookiefile_copy(cookie_path: str) -> Optional[str]:
 
         if source_path.startswith("/etc/secrets/"):
             logger.info("Cookies secret copiadas a ruta escribible para yt-dlp: %s", runtime_path)
+        else:
+            logger.info("Cookies preparadas desde %s hacia %s", source_path, runtime_path)
 
         return runtime_path
     except Exception as exc:
@@ -232,14 +253,21 @@ def _writable_cookiefile_copy(cookie_path: str) -> Optional[str]:
 
 
 def get_cookiefile_path() -> Optional[str]:
-    """Devuelve cookies válidas usando el orden del código nuevo."""
+    """Devuelve cookies válidas priorizando Render Secret File real.
+
+    Si existe /etc/secrets/cookies.txt, se usa primero para evitar agarrar
+    un cookies.txt viejo del repo o una variable apuntando a /tmp.
+    """
     candidates = []
+
+    # Secret File real de Render primero.
+    candidates.append("/etc/secrets/cookies.txt")
 
     env_cookie = (os.getenv("YTDLP_COOKIES_FILE") or os.getenv("COOKIES_FILE") or "").strip()
     if env_cookie:
         candidates.append(env_cookie)
 
-    candidates.append("/etc/secrets/cookies.txt")
+    # Local/repo solo como último respaldo.
     candidates.append("cookies.txt")
 
     seen = set()
@@ -268,6 +296,11 @@ def _build_ytdlp_opts(use_cookies: bool = True) -> Dict:
     """Opciones de yt-dlp manteniendo el flujo viejo: una búsqueda y primer resultado."""
     opts = dict(ydl_opts)
     opts.pop("cookiefile", None)
+
+    # Igual que el código nuevo: ayuda con YouTube en hosting cloud.
+    if "get_youtube_extractor_args" in globals():
+        opts["extractor_args"] = get_youtube_extractor_args()
+    opts["ignore_no_formats_error"] = True
 
     if use_cookies:
         cookiefile = get_cookiefile_path()
