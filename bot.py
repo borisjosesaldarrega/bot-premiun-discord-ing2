@@ -561,7 +561,7 @@ async def join(ctx: commands.Context) -> None:
         
 @bot.command(name='play', aliases=['p', 'reproduce', 'ponme'])
 async def play(ctx: commands.Context, *, busqueda: str) -> None:
-    """Reproduce música o la añade a la cola"""
+    """Reproduce música o la añade a la cola - CORREGIDO para búsqueda por nombre"""
     if not check_same_voice_channel(ctx):
         return await ctx.send("❌ Debes estar en el mismo canal de voz que el bot para usar este comando.")
     await update_last_activity(ctx.guild.id)
@@ -588,74 +588,96 @@ async def play(ctx: commands.Context, *, busqueda: str) -> None:
 
     try:
         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-            info = await extract_info_async(
-                ydl,
-                busqueda if is_url else f"ytsearch:{busqueda}",
-                download=False
+            # CORRECCIÓN PRINCIPAL: Manejar correctamente la búsqueda
+            search_query = busqueda if is_url else f"ytsearch:{busqueda}"
+            info = await extract_info_async(ydl, search_query, download=False)
+            
+            # Verificar si info es None o no tiene la estructura esperada
+            if info is None:
+                raise Exception("No se encontraron resultados para tu búsqueda.")
+
+            # Manejar resultados de búsqueda (ytsearch devuelve un dict con 'entries')
+            if 'entries' in info:
+                if not info['entries']:
+                    raise Exception("No se encontraron resultados para tu búsqueda.")
+                info = info['entries'][0]
+            
+            # Verificar que info tenga la estructura mínima necesaria
+            if info is None or not isinstance(info, dict):
+                raise Exception("Formato de respuesta inválido desde YouTube.")
+
+            # Obtener la URL del audio de manera segura
+            if 'url' in info and info['url']:
+                url2 = info['url']
+            elif 'formats' in info and info['formats']:
+                # Buscar el mejor formato de audio
+                format_audio = next(
+                    (f for f in info['formats'] if f.get('acodec') != 'none' and f.get('vcodec') == 'none'),
+                    next((f for f in info['formats'] if f.get('acodec') != 'none'), info['formats'][0])
+                )
+                url2 = format_audio['url']
+            else:
+                raise Exception("No se pudo obtener la URL del audio.")
+
+            # Construir el objeto de la canción
+            song = {
+                "title": info.get("title", busqueda)[:200],  # Limitar longitud
+                "url": url2,
+                "web_url": info.get("webpage_url", busqueda),
+                "duration": int(info.get("duration", 0)),
+                "requested_by": ctx.author,
+                "thumbnail": info.get("thumbnail", "")
+            }
+
+            await cargando_msg.delete()
+
+            # Si ya hay música sonando, añadir a la cola
+            if voice_client.is_playing() or voice_client.is_paused():
+                queues.setdefault(ctx.guild.id, []).append(song)
+
+                embed = discord.Embed(
+                    title="🎵 Añadido a la cola",
+                    description=f"[{song['title']}]({song['web_url']})",
+                    color=discord.Color.green()
+                )
+                embed.add_field(name="Posición en cola", value=str(len(queues[ctx.guild.id])))
+                embed.set_thumbnail(url=song['thumbnail'])
+                embed.set_footer(text=f"Solicitado por {ctx.author.display_name}")
+                return await ctx.send(embed=embed)
+
+            # Reproducir inmediatamente
+            global current_song
+            current_song = song
+            save_to_history(ctx.guild.id, current_song)
+
+            source = await discord.FFmpegOpusAudio.from_probe(
+                url2,
+                method='fallback',
+                **FFMPEG_OPTIONS
             )
 
-        if 'entries' in info:
-            info = info['entries'][0]
-
-        url2 = info.get('url') or next(
-            (f for f in info['formats'] if f.get('acodec') != 'none'),
-            info['formats'][0]
-        )['url']
-
-        song = {
-            "title": info.get("title") or busqueda,
-            "url": url2,
-            "web_url": info.get("webpage_url") or busqueda,
-            "duration": int(info.get("duration", 0)),
-            "requested_by": ctx.author,
-            "thumbnail": info.get("thumbnail", "")
-        }
-
-        await cargando_msg.delete()
-
-        if voice_client.is_playing() or voice_client.is_paused():
-            queues.setdefault(ctx.guild.id, []).append(song)
+            voice_client.play(
+                source,
+                after=lambda e: asyncio.run_coroutine_threadsafe(
+                    check_queue(ctx),
+                    bot.loop
+                ) if e is None else print(f'Error: {e}')
+            )
 
             embed = discord.Embed(
-                title="🎵 Añadido a la cola",
-                description=f"[{song['title']}]({song['web_url']})",
-                color=discord.Color.green()
+                title="🎵 Reproduciendo ahora",
+                description=f"[{current_song['title']}]({current_song['web_url']})",
+                color=discord.Color.blurple()
             )
-            embed.add_field(name="Posición en cola", value=str(len(queues[ctx.guild.id])))
-            embed.set_thumbnail(url=song['thumbnail'])
+            duration = current_song['duration']
+            if duration > 0:
+                embed.add_field(name="Duración", value=f"{duration // 60}:{duration % 60:02d}")
+            else:
+                embed.add_field(name="Duración", value="Desconocida")
+            embed.set_thumbnail(url=current_song['thumbnail'])
             embed.set_footer(text=f"Solicitado por {ctx.author.display_name}")
-            return await ctx.send(embed=embed)
 
-        global current_song
-        current_song = song
-        save_to_history(ctx.guild.id, current_song)
-
-        source = await discord.FFmpegOpusAudio.from_probe(
-            url2,
-            method='fallback',
-            **FFMPEG_OPTIONS
-        )
-
-        voice_client.play(
-            source,
-            after=lambda e: asyncio.run_coroutine_threadsafe(
-                check_queue(ctx),
-                bot.loop
-            ) if e is None else print(f'Error: {e}')
-        )
-
-        embed = discord.Embed(
-            title="🎵 Reproduciendo ahora",
-            description=f"[{current_song['title']}]({current_song['web_url']})",
-            color=discord.Color.blurple()
-        )
-        duration = current_song['duration']
-        embed.add_field(name="Duración",
-                        value=f"{duration // 60}:{duration % 60:02d}" if duration else "Desconocida")
-        embed.set_thumbnail(url=current_song['thumbnail'])
-        embed.set_footer(text=f"Solicitado por {ctx.author.display_name}")
-
-        await ctx.send(embed=embed)
+            await ctx.send(embed=embed)
 
     except Exception as e:
         await cargando_msg.delete()
@@ -4074,22 +4096,8 @@ async def on_voice_state_update(member, before, after):
                     logger.info(f"Reconectado al canal de voz {before.channel.name}")
                     
                     # Reanudar reproducción si había
-                    # Reanudar reproducción si había
                     if guild_id in queues and queues[guild_id]:
-                        class SimulatedContext:
-                            def __init__(self, guild):
-                                self.guild = guild
-                                self.voice_client = guild.voice_client
-                                # Intentamos buscar el canal original donde se pidió la música
-                                canal_id = music_origin_channels.get(guild.id)
-                                self.channel = guild.get_channel(canal_id) if canal_id else None
-                            
-                            async def send(self, *args, **kwargs):
-                                if self.channel:
-                                    return await self.channel.send(*args, **kwargs)
-
-                        fake_ctx = SimulatedContext(before.channel.guild)
-                        await check_queue(fake_ctx)
+                        await check_queue(before.channel.guild)
                 except Exception as e:
                     logger.error(f"Error al reconectar: {str(e)}")
                     dj_sessions[guild_id]["active"] = False
@@ -4893,17 +4901,8 @@ async def karaoke_entrar(ctx: commands.Context, *, cancion: str):
         with youtube_dl.YoutubeDL(ydl_opts) as ydl:
             info = await extract_info_async(ydl, cancion if is_url else f"ytsearch:{cancion}", download=False)
         if 'entries' in info:
-            if not info['entries'] or info['entries'][0] is None:
-                raise Exception("YouTube no devolvió resultados o bloqueó esta canción.")
             info = info['entries'][0]
-
-        if info is None:
-            raise Exception("No se pudo obtener la información del video.")
-
-        url2 = info.get('url') or next(
-            (f for f in info['formats'] if f.get('acodec') != 'none'),
-            info['formats'][0]
-        )['url']
+        url2 = info.get('url') or next((f for f in info['formats'] if f.get('acodec') != 'none'), info['formats'][0])['url']
         entry = {"member_id": ctx.author.id, "name": ctx.author.display_name, "song_title": info.get("title") or cancion, "url": url2, "web_url": info.get("webpage_url") or cancion, "score": None}
         session["queue"].append(entry)
         await msg.edit(content=f"✅ {ctx.author.mention} apuntado con **{entry['song_title']}**")
