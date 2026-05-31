@@ -5419,77 +5419,183 @@ async def ticket_panel_slash_moderno(interaction: discord.Interaction):
 # Bienvenida visual
 # --------------------------
 async def build_welcome_card(member: discord.Member) -> Optional[discord.File]:
+    """Crea una tarjeta de bienvenida moderna para Discord."""
     try:
-        from PIL import Image, ImageDraw, ImageFont, ImageOps
-        width, height = 1100, 420
-        img = Image.new("RGB", (width, height), (17, 24, 39))
-        draw = ImageDraw.Draw(img)
-        for y in range(height):
-            shade = int(24 + (y / height) * 24)
-            draw.line([(0, y), (width, y)], fill=(17, shade, 52))
-        draw.rounded_rectangle((35, 35, width - 35, height - 35), radius=32, outline=(245, 158, 11), width=4)
-        draw.rounded_rectangle((70, 280, width - 70, 350), radius=24, fill=(31, 41, 55))
+        from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
+
+        width, height = 1200, 430
+
         def font(size: int, bold: bool = False):
             candidates = [
                 "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf",
                 "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
             ]
             for fp in candidates:
                 if fp and os.path.exists(fp):
                     return ImageFont.truetype(fp, size)
             return ImageFont.load_default()
-        title_font, name_font, text_font, small_font = font(56, True), font(42, True), font(28), font(22)
+
+        def fit_text(draw_obj, text: str, max_width: int, start_size: int, bold: bool = False, min_size: int = 24):
+            size = start_size
+            while size >= min_size:
+                f = font(size, bold)
+                bbox = draw_obj.textbbox((0, 0), text, font=f)
+                if (bbox[2] - bbox[0]) <= max_width:
+                    return f
+                size -= 2
+            return font(min_size, bold)
+
+        def rounded_rect_mask(size, radius):
+            mask = Image.new("L", size, 0)
+            md = ImageDraw.Draw(mask)
+            md.rounded_rectangle((0, 0, size[0] - 1, size[1] - 1), radius=radius, fill=255)
+            return mask
+
+        # Fondo principal con degradado oscuro.
+        img = Image.new("RGBA", (width, height), (9, 13, 23, 255))
+        bg = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        bg_draw = ImageDraw.Draw(bg)
+        for y in range(height):
+            r = int(10 + (y / height) * 8)
+            g = int(17 + (y / height) * 18)
+            b = int(31 + (y / height) * 34)
+            bg_draw.line([(0, y), (width, y)], fill=(r, g, b, 255))
+        img.alpha_composite(bg)
+
+        draw = ImageDraw.Draw(img)
+
+        # Brillos suaves y detalles del fondo.
+        glow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow)
+        gd.ellipse((-180, -160, 430, 450), fill=(34, 211, 238, 42))
+        gd.ellipse((760, -220, 1320, 360), fill=(99, 102, 241, 34))
+        gd.ellipse((690, 260, 1320, 610), fill=(245, 158, 11, 20))
+        glow = glow.filter(ImageFilter.GaussianBlur(46))
+        img.alpha_composite(glow)
+
+        # Marco general.
+        card_margin = 32
+        draw.rounded_rectangle(
+            (card_margin, card_margin, width - card_margin, height - card_margin),
+            radius=34,
+            fill=(15, 23, 42, 232),
+            outline=(34, 211, 238, 150),
+            width=3
+        )
+
+        # Barra lateral de acento.
+        draw.rounded_rectangle((32, 32, 43, height - 32), radius=8, fill=(34, 211, 238, 255))
+        draw.rounded_rectangle((43, 32, 48, height - 32), radius=8, fill=(245, 158, 11, 200))
+
+        # Decoración sutil.
+        for x, y, s, c in [
+            (1000, 78, 7, (34, 211, 238, 180)),
+            (1045, 310, 5, (245, 158, 11, 180)),
+            (226, 84, 4, (147, 197, 253, 150)),
+            (1110, 142, 4, (255, 255, 255, 110)),
+            (905, 335, 3, (34, 211, 238, 150)),
+        ]:
+            draw.ellipse((x - s, y - s, x + s, y + s), fill=c)
+
+        # Avatar del usuario.
         avatar_bytes = await member.display_avatar.replace(size=256, static_format="png").read()
-        avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((180, 180))
-        mask = Image.new("L", avatar.size, 0)
-        mask_draw = ImageDraw.Draw(mask)
-        mask_draw.ellipse((0, 0, 180, 180), fill=255)
-        avatar = ImageOps.fit(avatar, (180, 180), centering=(0.5, 0.5))
-        img.paste(avatar, (80, 100), mask)
-        draw.ellipse((76, 96, 264, 284), outline=(245, 158, 11), width=6)
-        guild_name = member.guild.name[:32]
+        avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+        avatar = ImageOps.fit(avatar, (190, 190), centering=(0.5, 0.5))
+
+        avatar_mask = Image.new("L", (190, 190), 0)
+        avatar_mask_draw = ImageDraw.Draw(avatar_mask)
+        avatar_mask_draw.ellipse((0, 0, 190, 190), fill=255)
+
+        # Glow del avatar.
+        avatar_glow = Image.new("RGBA", (260, 260), (0, 0, 0, 0))
+        agd = ImageDraw.Draw(avatar_glow)
+        agd.ellipse((26, 26, 234, 234), fill=(34, 211, 238, 95))
+        avatar_glow = avatar_glow.filter(ImageFilter.GaussianBlur(18))
+        img.alpha_composite(avatar_glow, (64, 83))
+
+        img.paste(avatar, (100, 118), avatar_mask)
+        draw.ellipse((94, 112, 296, 314), outline=(34, 211, 238, 255), width=6)
+        draw.ellipse((86, 104, 304, 322), outline=(245, 158, 11, 155), width=3)
+
+        # Textos principales.
+        guild_name = (member.guild.name or "el servidor")[:34]
         member_count = member.guild.member_count or len(member.guild.members)
-        display = member.display_name[:28]
-        draw.text((300, 95), "¡Bienvenido/a!", font=title_font, fill=(255, 255, 255))
-        draw.text((300, 165), display, font=name_font, fill=(245, 158, 11))
-        draw.text((300, 225), f"Ahora formas parte de {guild_name}", font=text_font, fill=(229, 231, 235))
-        draw.text((95, 300), f"Miembro #{member_count}  •  Pásala bien y respeta las reglas 😎", font=text_font, fill=(255, 255, 255))
-        draw.text((70, 365), "Archeon Welcome System", font=small_font, fill=(156, 163, 175))
+        display = member.display_name[:32]
+
+        small_title = font(28, True)
+        username_font = fit_text(draw, display, 710, 58, True, 34)
+        body_font = font(31)
+        stat_font = font(26, True)
+        foot_font = font(20)
+
+        draw.text((340, 104), "¡BIENVENIDO/A!", font=small_title, fill=(34, 211, 238, 255))
+        draw.text((340, 150), display, font=username_font, fill=(248, 250, 252, 255))
+        draw.text((340, 224), f"Ahora formas parte de {guild_name}", font=body_font, fill=(203, 213, 225, 255))
+
+        # Pill inferior.
+        pill_x1, pill_y1, pill_x2, pill_y2 = 340, 286, width - 86, 354
+        draw.rounded_rectangle((pill_x1, pill_y1, pill_x2, pill_y2), radius=28, fill=(2, 6, 23, 210), outline=(51, 65, 85, 180), width=2)
+
+        draw.text((372, 304), f"Miembro #{member_count}", font=stat_font, fill=(34, 211, 238, 255))
+        draw.text((570, 304), "•", font=stat_font, fill=(148, 163, 184, 255))
+        draw.text((604, 304), "Lee las reglas, saluda y disfruta la comunidad", font=stat_font, fill=(241, 245, 249, 255))
+
+        # Footer discreto.
+        draw.text((86, 374), "Archeon • Sistema de bienvenida", font=foot_font, fill=(148, 163, 184, 255))
+        draw.text((width - 300, 374), "Comunidad activa ✦ Respeto ✦ Diversión", font=foot_font, fill=(100, 116, 139, 255))
+
+        # Recorte final redondeado.
+        final = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        final_mask = rounded_rect_mask((width, height), 36)
+        final.paste(img, (0, 0), final_mask)
+
         buffer = io.BytesIO()
-        img.save(buffer, format="PNG")
+        final.convert("RGB").save(buffer, format="PNG", optimize=True)
         buffer.seek(0)
         return discord.File(buffer, filename="bienvenida_archeon.png")
+
     except Exception:
         logger.error(f"No pude generar card de bienvenida: {traceback.format_exc()}")
         return None
+
 
 @bot.event
 async def on_member_join(member: discord.Member):
     if not WELCOME_ENABLED:
         return
+
     channel = member.guild.get_channel(WELCOME_CHANNEL_ID) or bot.get_channel(WELCOME_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
         logger.warning(f"No encontré canal de bienvenida con ID {WELCOME_CHANNEL_ID}.")
         return
+
     try:
+        guild_name = member.guild.name
+        member_count = member.guild.member_count or len(member.guild.members)
+
         embed = discord.Embed(
             title=f"🌟 ¡Bienvenido/a, {member.display_name}!",
             description=(
-                f"{member.mention}, llegaste a **{member.guild.name}**.\n\n"
-                "📌 Lee las reglas, saluda sin miedo y disfruta el server.\n"
-                f"👥 Ahora somos **{member.guild.member_count}** miembros."
+                f"{member.mention}, llegaste a **{guild_name}**.\n\n"
+                "🛡️ Lee las reglas, saluda sin miedo y disfruta el server.\n"
+                f"👥 Ahora somos **{member_count}** miembros."
             ),
-            color=0xF59E0B
+            color=0x22D3EE
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.set_footer(text="Archeon • Sistema de bienvenida")
+        embed.timestamp = datetime.utcnow()
+
         card = await build_welcome_card(member)
+
         if card:
             embed.set_image(url="attachment://bienvenida_archeon.png")
             await channel.send(content=f"🎉 {member.mention}", embed=embed, file=card)
         else:
             await channel.send(content=f"🎉 {member.mention}", embed=embed)
+
     except Exception:
         logger.error(f"Error enviando bienvenida: {traceback.format_exc()}")
 
@@ -5673,6 +5779,5 @@ async def on_ready():
         create_logged_task(safe_background_task(save_data_periodically), "save_data_periodically")
         bot._dz_background_started = True
         logger.info("Tareas en segundo plano iniciadas con manejo seguro")
-
 
 bot.run(TOKEN)
