@@ -152,21 +152,17 @@ ydl_opts = {
 }
 
 def get_youtube_player_clients() -> List[str]:
-    """Clientes alternos de YouTube.
-
-    Mantiene el estilo bruto: mismo query, primer resultado.
-    Estos clientes solo se usan para intentar extraer audio del MISMO video.
-    """
+    """Clientes de YouTube para una sola extracción rápida."""
     raw = os.getenv(
         "YTDLP_YOUTUBE_CLIENTS",
-        "default,android_vr,android,ios,web_safari,web_embedded,mweb"
+        "default,-android_sdkless,web_safari,web_embedded,mweb"
     )
     clients: List[str] = []
     for part in raw.split(","):
         client = part.strip()
         if client and client not in clients:
             clients.append(client)
-    return clients or ["default", "android_vr", "android", "ios"]
+    return clients or ["default", "-android_sdkless", "web_safari", "web_embedded", "mweb"]
 
 
 def get_youtube_extractor_args(player_client: Optional[Union[str, List[str]]] = None) -> Dict[str, Dict[str, List[str]]]:
@@ -177,11 +173,20 @@ def get_youtube_extractor_args(player_client: Optional[Union[str, List[str]]] = 
     else:
         clients = list(player_client)
 
-    return {
-        "youtube": {
-            "player_client": clients,
-        }
+    youtube_args: Dict[str, List[str]] = {
+        "player_client": clients,
+        # Clave para que yt-dlp no bote formatos cuando falta PO token.
+        # No cambia de canción ni hace búsquedas extra.
+        "formats": [
+            os.getenv("YTDLP_YOUTUBE_FORMATS", "missing_pot").strip() or "missing_pot"
+        ],
     }
+
+    po_token = (os.getenv("YTDLP_YOUTUBE_PO_TOKEN") or "").strip()
+    if po_token:
+        youtube_args["po_token"] = [po_token]
+
+    return {"youtube": youtube_args}
 
 
 _COOKIE_RUNTIME_CACHE: Dict[str, Dict[str, Union[str, float, int]]] = {}
@@ -309,7 +314,7 @@ def get_cookiefile_path() -> Optional[str]:
 def _build_ytdlp_opts(
     use_cookies: bool = True,
     player_client: Optional[Union[str, List[str]]] = None,
-    allow_incomplete: bool = True
+    allow_incomplete: bool = False
 ) -> Dict:
     """Opciones de yt-dlp manteniendo el flujo viejo: una búsqueda y primer resultado."""
     opts = dict(ydl_opts)
@@ -319,13 +324,17 @@ def _build_ytdlp_opts(
     if "get_youtube_extractor_args" in globals():
         opts["extractor_args"] = get_youtube_extractor_args(player_client)
 
-    # Si queda metadata sin audio, queremos recibirla para reintentar el MISMO video.
+    # No aceptar "metadata sin audio" como resultado bueno.
     opts["ignore_no_formats_error"] = allow_incomplete
 
     # Evita playlists raras y fuerza IPv4, suele ser más estable en Render.
     opts["noplaylist"] = True
     opts["force_ipv4"] = True
     opts["cachedir"] = False
+    opts["http_headers"] = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    }
 
     if use_cookies:
         cookiefile = get_cookiefile_path()
@@ -351,7 +360,7 @@ def _first_ytdlp_result(info):
 
 
 def _audio_url_from_info(info: Dict) -> Optional[str]:
-    """Saca la URL de audio del mismo resultado; no busca canciones extra."""
+    """Saca la URL de audio del primer resultado."""
     if not isinstance(info, dict):
         return None
 
@@ -360,8 +369,15 @@ def _audio_url_from_info(info: Dict) -> Optional[str]:
         if isinstance(items, dict):
             items = [items]
         for item in items:
-            if isinstance(item, dict) and item.get("url"):
-                return item.get("url")
+            if not isinstance(item, dict):
+                continue
+            item_url = item.get("url")
+            if (
+                isinstance(item_url, str)
+                and item_url.startswith(("http://", "https://"))
+                and not item.get("has_drm")
+            ):
+                return item_url
 
     direct_url = info.get("url")
     if isinstance(direct_url, str) and direct_url.startswith(("http://", "https://")):
@@ -369,36 +385,49 @@ def _audio_url_from_info(info: Dict) -> Optional[str]:
 
     formats = info.get("formats") or []
 
-    for fmt in formats:
-        if (
-            isinstance(fmt, dict)
-            and fmt.get("url")
-            and fmt.get("acodec") not in (None, "none")
-            and fmt.get("vcodec") in (None, "none")
-        ):
-            return fmt.get("url")
+    def is_good_audio(fmt: Dict) -> bool:
+        if not isinstance(fmt, dict):
+            return False
+        fmt_url = fmt.get("url")
+        if not isinstance(fmt_url, str) or not fmt_url.startswith(("http://", "https://")):
+            return False
+        if fmt.get("has_drm"):
+            return False
+        acodec = fmt.get("acodec")
+        if acodec in (None, "none"):
+            return False
+        return True
 
-    for fmt in formats:
-        if isinstance(fmt, dict) and fmt.get("url") and fmt.get("acodec") not in (None, "none"):
-            return fmt.get("url")
+    audio_only = [
+        f for f in formats
+        if is_good_audio(f) and f.get("vcodec") in (None, "none")
+    ]
+    if audio_only:
+        audio_only.sort(
+            key=lambda f: (
+                0 if f.get("ext") in ("m4a", "webm", "opus") else 1,
+                -(f.get("abr") or 0),
+                -(f.get("tbr") or 0),
+            )
+        )
+        return audio_only[0].get("url")
 
-    for fmt in formats:
-        if isinstance(fmt, dict):
-            fmt_url = fmt.get("url")
-            if isinstance(fmt_url, str) and fmt_url.startswith(("http://", "https://")):
-                return fmt_url
+    with_audio = [f for f in formats if is_good_audio(f)]
+    if with_audio:
+        with_audio.sort(key=lambda f: (-(f.get("abr") or 0), -(f.get("tbr") or 0)))
+        return with_audio[0].get("url")
 
     return None
-
 
 
 async def extract_brute_ytdlp_info(search_query: str) -> Dict:
     """Extracción rápida estilo viejo.
 
-    Una búsqueda, primer resultado. Nada de reintentos por clientes, nada de buscar
-    alternativas. Solo:
+    Una búsqueda, primer resultado:
     1) intento con cookies si existen
     2) intento sin cookies si el primero no da audio
+
+    Sin búsqueda múltiple, sin cambiar de canción, sin fallback de clientes.
     """
     attempts = []
     opts_with_cookie = _build_ytdlp_opts(use_cookies=True)
@@ -412,6 +441,7 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
 
     last_title = None
     last_formats = None
+    last_keys = None
 
     for label, opts in attempts:
         try:
@@ -433,24 +463,26 @@ async def extract_brute_ytdlp_info(search_query: str) -> Dict:
 
             last_title = info.get("title", "sin título")
             last_formats = len(info.get("formats") or [])
+            last_keys = list(info.keys())[:12]
             logger.warning(
-                "yt-dlp encontró metadata pero sin audio (%s). Título=%s | formats=%s",
+                "yt-dlp encontró metadata pero sin audio (%s). Título=%s | formats=%s | keys=%s",
                 label,
                 str(last_title)[:120],
                 last_formats,
+                last_keys,
             )
 
         except Exception as e:
-            logger.warning("yt-dlp falló %s para '%s': %s", label, search_query, str(e)[:180])
+            logger.warning("yt-dlp falló %s para '%s': %s", label, search_query, str(e)[:220])
 
     if last_title:
         raise Exception(
             f"YouTube encontró **{str(last_title)[:80]}**, pero no entregó audio reproducible "
-            f"(formats={last_formats}). Reexporta cookies.txt o prueba una URL directa."
+            f"(formats={last_formats}). Revisa que yt-dlp esté actualizado y que cookies.txt sea reciente."
         )
 
     raise Exception(
-        "YouTube no devolvió audio reproducible. Reexporta cookies.txt o prueba una URL directa."
+        "YouTube no devolvió audio reproducible. Revisa yt-dlp/cookies.txt o prueba una URL directa."
     )
 
 
